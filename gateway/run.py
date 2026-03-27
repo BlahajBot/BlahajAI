@@ -2427,6 +2427,49 @@ class GatewayRunner:
                 message_text = f"{context_note}\n\n{message_text}"
 
         # -----------------------------------------------------------------
+        # Enrich video messages with metadata + thumbnail for the agent
+        #
+        # Videos are NOT sent to the model (few models support video input).
+        # Instead, we extract metadata via ffprobe and a thumbnail via ffmpeg,
+        # then inject a text note so the agent knows the file path and details.
+        # -----------------------------------------------------------------
+        if event.media_urls and event.message_type == MessageType.VIDEO:
+            from gateway.platforms.base import extract_video_metadata, extract_video_thumbnail
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                if not (mtype.startswith("video/") or event.message_type == MessageType.VIDEO):
+                    continue
+
+                meta = await extract_video_metadata(path)
+                thumb_path = await extract_video_thumbnail(path)
+
+                # Build a human-readable metadata summary
+                parts = []
+                if meta.get("duration"):
+                    dur = meta["duration"]
+                    parts.append(f"duration {int(dur)}s" if dur < 3600 else f"duration {dur:.0f}s")
+                if meta.get("width") and meta.get("height"):
+                    parts.append(f"{meta['width']}x{meta['height']}")
+                if meta.get("codec"):
+                    parts.append(meta["codec"])
+                if meta.get("filesize_mb"):
+                    parts.append(f"{meta['filesize_mb']}MB")
+
+                meta_str = ", ".join(parts) if parts else "metadata unavailable"
+
+                context_note = (
+                    f"[The user sent a video: {meta_str}.\n"
+                    f"The video file is saved at: {path}"
+                )
+                if thumb_path:
+                    context_note += (
+                        f"\nA thumbnail frame is available at: {thumb_path}\n"
+                        f"If you need a closer look at the thumbnail, use vision_analyze with image_url: {thumb_path}"
+                    )
+                context_note += "]"
+                message_text = f"{context_note}\n\n{message_text}"
+
+        # -----------------------------------------------------------------
         # Inject reply context when user replies to a message not in history.
         # Telegram (and other platforms) let users reply to specific messages,
         # but if the quoted message is from a previous session, cron delivery,
@@ -5653,7 +5696,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
     image/audio/document cache once per hour.
     """
     from cron.scheduler import tick as cron_tick
-    from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
+    from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache, cleanup_video_cache
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
@@ -5688,6 +5731,12 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
                     logger.info("Document cache cleanup: removed %d stale file(s)", removed)
             except Exception as e:
                 logger.debug("Document cache cleanup error: %s", e)
+            try:
+                removed = cleanup_video_cache(max_age_hours=24)
+                if removed:
+                    logger.info("Video cache cleanup: removed %d stale file(s)", removed)
+            except Exception as e:
+                logger.debug("Video cache cleanup error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")

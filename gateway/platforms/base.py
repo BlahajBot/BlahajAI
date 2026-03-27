@@ -277,6 +277,239 @@ def cleanup_document_cache(max_age_hours: int = 24) -> int:
     return removed
 
 
+# ---------------------------------------------------------------------------
+# Video cache utilities
+#
+# Same pattern as image/audio cache -- video files from platforms are
+# downloaded here so the agent can reference them by local file path.
+# Videos are NOT sent to the model (few models support video input);
+# instead, metadata and a thumbnail are injected as a text note.
+# ---------------------------------------------------------------------------
+
+VIDEO_CACHE_DIR = get_hermes_home() / "video_cache"
+
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".avi", ".mkv"}
+
+# 100 MB — reject videos larger than this to avoid filling the disk
+MAX_VIDEO_BYTES = 100 * 1024 * 1024
+
+
+def get_video_cache_dir() -> Path:
+    """Return the video cache directory, creating it if it doesn't exist."""
+    VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return VIDEO_CACHE_DIR
+
+
+def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
+    """
+    Save raw video bytes to the cache and return the absolute file path.
+
+    Args:
+        data: Raw video bytes.
+        ext:  File extension including the dot (e.g. ".mp4", ".webm").
+
+    Returns:
+        Absolute path to the cached video file as a string.
+    """
+    cache_dir = get_video_cache_dir()
+    filename = f"vid_{uuid.uuid4().hex[:12]}{ext}"
+    filepath = cache_dir / filename
+    filepath.write_bytes(data)
+    return str(filepath)
+
+
+async def cache_video_from_url(url: str, ext: str = ".mp4", retries: int = 2) -> str:
+    """
+    Download a video from a URL using streaming and save it to the local cache.
+
+    Uses chunked streaming to avoid loading the entire file into memory.
+    Rejects files exceeding MAX_VIDEO_BYTES.
+
+    Args:
+        url: The HTTP/HTTPS URL to download from.
+        ext: File extension including the dot (e.g. ".mp4", ".webm").
+        retries: Number of retry attempts on transient failures.
+
+    Returns:
+        Absolute path to the cached video file as a string.
+
+    Raises:
+        ValueError: If the video exceeds the size limit.
+    """
+    import httpx
+
+    cache_dir = get_video_cache_dir()
+    filename = f"vid_{uuid.uuid4().hex[:12]}{ext}"
+    filepath = cache_dir / filename
+
+    last_exc = None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=120.0), follow_redirects=True) as client:
+        for attempt in range(retries + 1):
+            try:
+                async with client.stream(
+                    "GET", url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                        "Accept": "video/*,*/*;q=0.8",
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    # Check Content-Length header if available
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > MAX_VIDEO_BYTES:
+                        raise ValueError(
+                            f"Video too large ({int(content_length)} bytes > "
+                            f"{MAX_VIDEO_BYTES} byte limit)"
+                        )
+                    total = 0
+                    with open(filepath, "wb") as f:
+                        async for chunk in response.aiter_bytes(chunk_size=65536):
+                            total += len(chunk)
+                            if total > MAX_VIDEO_BYTES:
+                                # Clean up partial file
+                                f.close()
+                                filepath.unlink(missing_ok=True)
+                                raise ValueError(
+                                    f"Video too large (>{MAX_VIDEO_BYTES} bytes), "
+                                    f"download aborted"
+                                )
+                            f.write(chunk)
+                return str(filepath)
+            except ValueError:
+                raise  # Don't retry size-limit errors
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                last_exc = exc
+                # Clean up partial file on failure
+                filepath.unlink(missing_ok=True)
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                    raise
+                if attempt < retries:
+                    wait = 1.5 * (attempt + 1)
+                    logger.debug(
+                        "Video cache retry %d/%d for %s (%.1fs): %s",
+                        attempt + 1, retries, url[:80], wait, exc,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+    raise last_exc
+
+
+def cleanup_video_cache(max_age_hours: int = 24) -> int:
+    """
+    Delete cached videos older than *max_age_hours*.
+
+    Returns the number of files removed.
+    """
+    import time
+
+    cache_dir = get_video_cache_dir()
+    cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for f in cache_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+async def extract_video_metadata(video_path: str) -> dict:
+    """
+    Run ffprobe to extract video metadata (duration, resolution, codec, filesize).
+
+    Returns a dict with keys: duration, width, height, codec, filesize, filesize_mb.
+    Returns an empty dict if ffprobe is not installed or fails.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return {}
+
+        import json
+        data = json.loads(stdout.decode())
+
+        # Find the video stream
+        video_stream = None
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                video_stream = stream
+                break
+
+        result = {}
+        if video_stream:
+            result["width"] = int(video_stream.get("width", 0))
+            result["height"] = int(video_stream.get("height", 0))
+            result["codec"] = video_stream.get("codec_name", "unknown")
+
+        fmt = data.get("format", {})
+        duration = fmt.get("duration")
+        if duration:
+            result["duration"] = float(duration)
+        filesize = fmt.get("size")
+        if filesize:
+            result["filesize"] = int(filesize)
+            result["filesize_mb"] = round(int(filesize) / (1024 * 1024), 1)
+
+        return result
+    except FileNotFoundError:
+        logger.debug("ffprobe not found — skipping video metadata extraction")
+        return {}
+    except Exception as e:
+        logger.debug("ffprobe failed for %s: %s", video_path, e)
+        return {}
+
+
+async def extract_video_thumbnail(video_path: str, output_dir: str = None) -> Optional[str]:
+    """
+    Extract a representative frame from the video using ffmpeg.
+
+    The thumbnail is saved to the image cache so the vision tool can analyze it.
+
+    Args:
+        video_path: Path to the video file.
+        output_dir: Directory to save the thumbnail. Defaults to image cache.
+
+    Returns:
+        Absolute path to the thumbnail JPEG, or None if extraction fails.
+    """
+    if output_dir is None:
+        output_dir = str(get_image_cache_dir())
+
+    thumb_name = f"vidthumb_{uuid.uuid4().hex[:12]}.jpg"
+    thumb_path = os.path.join(output_dir, thumb_name)
+
+    try:
+        # First, get duration to pick a midpoint frame
+        meta = await extract_video_metadata(video_path)
+        seek_time = str(meta.get("duration", 2.0) / 2.0) if meta.get("duration") else "1"
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-ss", seek_time, "-i", video_path,
+            "-frames:v", "1", "-q:v", "2", thumb_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, _ = await proc.communicate()
+        if proc.returncode == 0 and os.path.isfile(thumb_path):
+            return thumb_path
+        return None
+    except FileNotFoundError:
+        logger.debug("ffmpeg not found — skipping video thumbnail extraction")
+        return None
+    except Exception as e:
+        logger.debug("ffmpeg thumbnail extraction failed for %s: %s", video_path, e)
+        return None
+
+
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"
