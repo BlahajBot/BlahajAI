@@ -75,6 +75,7 @@ def _prompt_yes_no(question: str, default: bool = True) -> bool:
 # These map to keys in toolsets.py TOOLSETS dict.
 CONFIGURABLE_TOOLSETS = [
     ("web",             "🔍 Web Search & Scraping",    "web_search, web_extract"),
+    ("brave",           "🦁 Brave Search",              "brave_web_search, brave_news_search"),
     ("browser",         "🌐 Browser Automation",       "navigate, click, type, scroll"),
     ("terminal",        "💻 Terminal & Processes",      "terminal, process"),
     ("file",            "📁 File Operations",           "read, write, patch, search"),
@@ -257,6 +258,19 @@ TOOL_CATEGORIES = {
                 ],
                 "browser_provider": "browser-use",
                 "post_setup": "browserbase",
+            },
+        ],
+    },
+    "brave": {
+        "name": "Brave Search",
+        "icon": "🦁",
+        "providers": [
+            {
+                "name": "Brave Search API",
+                "tag": "Web + news search with rich snippets (AI plan)",
+                "env_vars": [
+                    {"key": "BRAVE_SEARCH_API_KEY", "prompt": "Brave Search API key", "url": "https://brave.com/search/api/"},
+                ],
             },
         ],
     },

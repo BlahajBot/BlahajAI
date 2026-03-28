@@ -2141,7 +2141,7 @@ class Migrator:
         # Map web search API key
         web_cfg = tools.get("webSearch") or tools.get("web") or {}
         if web_cfg.get("braveApiKey") and self.migrate_secrets:
-            self._set_env_var("BRAVE_API_KEY", web_cfg["braveApiKey"], "tools.webSearch.braveApiKey")
+            self._set_env_var("BRAVE_SEARCH_API_KEY", web_cfg["braveApiKey"], "tools.webSearch.braveApiKey")
 
         if changed and self.execute:
             self.maybe_backup(hermes_cfg_path)

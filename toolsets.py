@@ -242,6 +242,7 @@ TOOLSETS = {
         "description": "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without messaging, audio, or clarify UI",
         "tools": [
             "web_search", "web_extract",
+            "brave_web_search", "brave_news_search",
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
@@ -262,6 +263,8 @@ TOOLSETS = {
         "tools": [
             # Web
             "web_search", "web_extract",
+            # Brave Search
+            "brave_web_search", "brave_news_search",
             # Terminal + process management
             "terminal", "process",
             # File manipulation
