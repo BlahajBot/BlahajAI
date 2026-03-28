@@ -46,7 +46,7 @@ tts:
     base_url: "https://api.openai.com/v1"  # Override for OpenAI-compatible TTS endpoints
   groq:
     model: "canopylabs/orpheus-v1-english"
-    voice: "tara"               # tara, leah, jess, leo, dan, mia, zac, zoe
+    voice: "Autumn"             # Autumn (F), Diana (F), Hannah (F), Austin (M), Daniel (M), Troy (M)
   neutts:
     ref_audio: ''
     ref_text: ''
