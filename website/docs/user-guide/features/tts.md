@@ -10,13 +10,14 @@ Hermes Agent supports both text-to-speech output and voice message transcription
 
 ## Text-to-Speech
 
-Convert text to speech with four providers:
+Convert text to speech with five providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
 | **Edge TTS** (default) | Good | Free | None needed |
 | **ElevenLabs** | Excellent | Paid | `ELEVENLABS_API_KEY` |
 | **OpenAI TTS** | Good | Paid | `VOICE_TOOLS_OPENAI_KEY` |
+| **Groq TTS** | Good | Free tier | `GROQ_API_KEY` |
 | **NeuTTS** | Good | Free | None needed |
 
 ### Platform Delivery
@@ -33,7 +34,7 @@ Convert text to speech with four providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "neutts"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "groq" | "neutts"
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
   elevenlabs:
@@ -43,6 +44,9 @@ tts:
     model: "gpt-4o-mini-tts"
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
     base_url: "https://api.openai.com/v1"  # Override for OpenAI-compatible TTS endpoints
+  groq:
+    model: "canopylabs/orpheus-v1-english"
+    voice: "tara"               # tara, leah, jess, leo, dan, mia, zac, zoe
   neutts:
     ref_audio: ''
     ref_text: ''
@@ -54,7 +58,7 @@ tts:
 
 Telegram voice bubbles require Opus/OGG audio format:
 
-- **OpenAI and ElevenLabs** produce Opus natively — no extra setup
+- **OpenAI, ElevenLabs, and Groq** produce Opus natively — no extra setup
 - **Edge TTS** (default) outputs MP3 and needs **ffmpeg** to convert:
 - **NeuTTS** outputs WAV and also needs **ffmpeg** to convert for Telegram voice bubbles
 
@@ -72,7 +76,7 @@ sudo dnf install ffmpeg
 Without ffmpeg, Edge TTS and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
 
 :::tip
-If you want voice bubbles without installing ffmpeg, switch to the OpenAI or ElevenLabs provider.
+If you want voice bubbles without installing ffmpeg, switch to the OpenAI, ElevenLabs, or Groq provider.
 :::
 
 ## Voice Message Transcription (STT)

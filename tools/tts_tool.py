@@ -2,10 +2,11 @@
 """
 Text-to-Speech Tool Module
 
-Supports four TTS providers:
+Supports five TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
+- Groq TTS: Fast inference, needs GROQ_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
 
 Output formats:
@@ -74,6 +75,9 @@ DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_STREAMING_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_VOICE = "alloy"
+DEFAULT_GROQ_MODEL = "canopylabs/orpheus-v1-english"
+DEFAULT_GROQ_VOICE = "tara"
+GROQ_TTS_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
     return str(get_hermes_dir("cache/audio", "audio_cache"))
@@ -266,6 +270,49 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
 
 # ===========================================================================
+# Provider: Groq TTS
+# ===========================================================================
+def _generate_groq_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """
+    Generate audio using Groq TTS (OpenAI-compatible API).
+
+    Args:
+        text: Text to convert.
+        output_path: Where to save the audio file.
+        tts_config: TTS config dict.
+
+    Returns:
+        Path to the saved audio file.
+    """
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY not set. Get one at https://console.groq.com/keys")
+
+    groq_config = tts_config.get("groq", {})
+    model = groq_config.get("model", DEFAULT_GROQ_MODEL)
+    voice = groq_config.get("voice", DEFAULT_GROQ_VOICE)
+    base_url = groq_config.get("base_url", GROQ_TTS_BASE_URL)
+
+    # Determine response format from extension
+    if output_path.endswith(".ogg"):
+        response_format = "opus"
+    else:
+        response_format = "mp3"
+
+    OpenAIClient = _import_openai_client()
+    client = OpenAIClient(api_key=api_key, base_url=base_url)
+    response = client.audio.speech.create(
+        model=model,
+        voice=voice,
+        input=text,
+        response_format=response_format,
+    )
+
+    response.stream_to_file(output_path)
+    return output_path
+
+
+# ===========================================================================
 # NeuTTS (local, on-device TTS via neutts_cli)
 # ===========================================================================
 
@@ -392,7 +439,7 @@ def text_to_speech_tool(
         out_dir.mkdir(parents=True, exist_ok=True)
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        if want_opus and provider in ("openai", "elevenlabs"):
+        if want_opus and provider in ("openai", "elevenlabs", "groq"):
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -424,6 +471,17 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with OpenAI TTS...")
             _generate_openai_tts(text, file_str, tts_config)
+
+        elif provider == "groq":
+            try:
+                _import_openai_client()
+            except ImportError:
+                return json.dumps({
+                    "success": False,
+                    "error": "Groq TTS provider selected but 'openai' package not installed."
+                }, ensure_ascii=False)
+            logger.info("Generating speech with Groq TTS...")
+            _generate_groq_tts(text, file_str, tts_config)
 
         elif provider == "neutts":
             if not _check_neutts_available():
@@ -480,7 +538,7 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in ("elevenlabs", "openai"):
+        elif provider in ("elevenlabs", "openai", "groq"):
             # These providers can output Opus natively if the path ends in .ogg
             voice_compatible = file_str.endswith(".ogg")
 
@@ -544,6 +602,12 @@ def check_tts_requirements() -> bool:
     try:
         _import_openai_client()
         if os.getenv("VOICE_TOOLS_OPENAI_KEY"):
+            return True
+    except ImportError:
+        pass
+    try:
+        _import_openai_client()
+        if os.getenv("GROQ_API_KEY"):
             return True
     except ImportError:
         pass
@@ -807,6 +871,8 @@ if __name__ == "__main__":
     print(f"    API Key:  {'set' if os.getenv('ELEVENLABS_API_KEY') else 'not set'}")
     print(f"  OpenAI:     {'installed' if _check(_import_openai_client, 'oai') else 'not installed'}")
     print(f"    API Key:  {'set' if os.getenv('VOICE_TOOLS_OPENAI_KEY') else 'not set (VOICE_TOOLS_OPENAI_KEY)'}")
+    print(f"  Groq:       {'installed' if _check(_import_openai_client, 'groq') else 'not installed (needs openai package)'}")
+    print(f"    API Key:  {'set' if os.getenv('GROQ_API_KEY') else 'not set (GROQ_API_KEY)'}")
     print(f"  ffmpeg:     {'✅ found' if _has_ffmpeg() else '❌ not found (needed for Telegram Opus)'}")
     print(f"\n  Output dir: {DEFAULT_OUTPUT_DIR}")
 
