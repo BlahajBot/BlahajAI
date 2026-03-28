@@ -2289,18 +2289,7 @@ class AIAgent:
                 or "hermes-default"
             )
 
-        honcho_sess = self._honcho.get_or_create(self._honcho_session_key)
-        if not honcho_sess.messages:
-            try:
-                from hermes_cli.config import get_hermes_home
-
-                mem_dir = str(get_hermes_home() / "memories")
-                self._honcho.migrate_memory_files(
-                    self._honcho_session_key,
-                    mem_dir,
-                )
-            except Exception as exc:
-                logger.debug("Memory files migration failed (non-fatal): %s", exc)
+        self._honcho.get_or_create(self._honcho_session_key)
 
         from tools.honcho_tools import set_session_context
 
