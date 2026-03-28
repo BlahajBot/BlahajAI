@@ -1874,6 +1874,7 @@ def _setup_tts_provider(config: dict):
         "edge": "Edge TTS",
         "elevenlabs": "ElevenLabs",
         "openai": "OpenAI TTS",
+        "groq": "Groq TTS",
         "neutts": "NeuTTS",
     }
     current_label = provider_labels.get(current_provider, current_provider)
@@ -1887,15 +1888,16 @@ def _setup_tts_provider(config: dict):
         "Edge TTS (free, cloud-based, no setup needed)",
         "ElevenLabs (premium quality, needs API key)",
         "OpenAI TTS (good quality, needs API key)",
+        "Groq TTS (fast inference, needs API key)",
         "NeuTTS (local on-device, free, ~300MB model download)",
         f"Keep current ({current_label})",
     ]
     idx = prompt_choice("Select TTS provider:", choices, len(choices) - 1)
 
-    if idx == 4:  # Keep current
+    if idx == 5:  # Keep current
         return
 
-    providers = ["edge", "elevenlabs", "openai", "neutts"]
+    providers = ["edge", "elevenlabs", "openai", "groq", "neutts"]
     selected = providers[idx]
 
     if selected == "neutts":
@@ -1942,6 +1944,18 @@ def _setup_tts_provider(config: dict):
             if api_key:
                 save_env_value("VOICE_TOOLS_OPENAI_KEY", api_key)
                 print_success("OpenAI TTS API key saved")
+            else:
+                print_warning("No API key provided. Falling back to Edge TTS.")
+                selected = "edge"
+
+    elif selected == "groq":
+        existing = get_env_value("GROQ_API_KEY")
+        if not existing:
+            print()
+            api_key = prompt("Groq API key", password=True)
+            if api_key:
+                save_env_value("GROQ_API_KEY", api_key)
+                print_success("Groq API key saved")
             else:
                 print_warning("No API key provided. Falling back to Edge TTS.")
                 selected = "edge"
