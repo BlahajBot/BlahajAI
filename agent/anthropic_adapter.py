@@ -323,7 +323,14 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
 
 
 def _write_claude_code_credentials(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
-    """Write refreshed credentials back to ~/.claude/.credentials.json."""
+    """Write refreshed credentials back to ~/.claude/.credentials.json.
+
+    Also syncs ANTHROPIC_TOKEN in ~/.hermes/.env so that resolve_anthropic_token()
+    returns the fresh token on the next call and does not trigger a second refresh
+    attempt that would race against the Claude Code CLI's own refresh logic.
+    (OAuth refresh tokens are single-use / rotating — concurrent refreshes cause
+    one side to get a 400 and lose its session entirely.)
+    """
     cred_path = Path.home() / ".claude" / ".credentials.json"
     try:
         # Read existing file to preserve other fields
@@ -343,6 +350,17 @@ def _write_claude_code_credentials(access_token: str, refresh_token: str, expire
         cred_path.chmod(0o600)
     except (OSError, IOError) as e:
         logger.debug("Failed to write refreshed credentials: %s", e)
+
+    # Sync the refreshed access token into ~/.hermes/.env so that the next call to
+    # resolve_anthropic_token() sees a current token and skips a redundant refresh.
+    # This prevents the race condition where both Hermes and the Claude Code CLI try
+    # to consume the (single-use) refresh token at the same time.
+    try:
+        from hermes_cli.config import save_env_value
+        save_env_value("ANTHROPIC_TOKEN", access_token)
+        logger.debug("Synced refreshed OAuth token to ANTHROPIC_TOKEN in .env")
+    except Exception as e:
+        logger.debug("Failed to sync refreshed token to .env: %s", e)
 
 
 def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
