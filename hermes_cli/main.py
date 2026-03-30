@@ -50,6 +50,23 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+def _require_tty(command_name: str) -> None:
+    """Exit with a clear error if stdin is not a terminal.
+
+    Interactive TUI commands (hermes tools, hermes setup, hermes model) use
+    curses or input() prompts that spin at 100% CPU when stdin is a pipe.
+    This guard prevents accidental non-interactive invocation.
+    """
+    if not sys.stdin.isatty():
+        print(
+            f"Error: 'hermes {command_name}' requires an interactive terminal.\n"
+            f"It cannot be run through a pipe or non-interactive subprocess.\n"
+            f"Run it directly in your terminal instead.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -617,6 +634,7 @@ def cmd_gateway(args):
 
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
+    _require_tty("whatsapp")
     import subprocess
     from pathlib import Path
     from hermes_cli.config import get_env_value, save_env_value
@@ -803,12 +821,14 @@ def cmd_whatsapp(args):
 
 def cmd_setup(args):
     """Interactive setup wizard."""
+    _require_tty("setup")
     from hermes_cli.setup import run_setup_wizard
     run_setup_wizard(args)
 
 
 def cmd_model(args):
     """Select default model — starts with provider selection, then model picker."""
+    _require_tty("model")
     from hermes_cli.auth import (
         resolve_provider, AuthError, format_auth_error,
     )
@@ -1084,14 +1104,20 @@ def _model_flow_nous(config, current_model=""):
         # login_nous already handles model selection + config update
         return
 
-    # Already logged in — fetch models and select
-    print("Fetching models from Nous Portal...")
+    # Already logged in — use curated model list (same as OpenRouter defaults).
+    # The live /models endpoint returns hundreds of models; the curated list
+    # shows only agentic models users recognize from OpenRouter.
+    from hermes_cli.models import _PROVIDER_MODELS
+    model_ids = _PROVIDER_MODELS.get("nous", [])
+    if not model_ids:
+        print("No curated models available for Nous Portal.")
+        return
+
+    print(f"Showing {len(model_ids)} curated models — use \"Enter custom model name\" for others.")
+
+    # Verify credentials are still valid (catches expired sessions early)
     try:
         creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
-        model_ids = fetch_nous_models(
-            inference_base_url=creds.get("base_url", ""),
-            api_key=creds.get("api_key", ""),
-        )
     except Exception as exc:
         relogin = isinstance(exc, AuthError) and exc.relogin_required
         msg = format_auth_error(exc) if isinstance(exc, AuthError) else str(exc)
@@ -1108,11 +1134,7 @@ def _model_flow_nous(config, current_model=""):
             except Exception as login_exc:
                 print(f"Re-login failed: {login_exc}")
             return
-        print(f"Could not fetch models: {msg}")
-        return
-
-    if not model_ids:
-        print("No models returned by the inference API.")
+        print(f"Could not verify credentials: {msg}")
         return
 
     selected = _prompt_model_selection(model_ids, current_model=current_model)
@@ -1269,7 +1291,7 @@ def _model_flow_custom(config):
             cfg["model"] = model
         model["provider"] = "custom"
         model["base_url"] = effective_url
-        model["api_mode"] = "chat_completions"
+        model.pop("api_mode", None)  # let runtime auto-detect from URL
         save_config(cfg)
         deactivate_provider()
 
@@ -2051,7 +2073,7 @@ def _model_flow_kimi(config, current_model=""):
             cfg["model"] = model
         model["provider"] = provider_id
         model["base_url"] = effective_base
-        model["api_mode"] = "chat_completions"
+        model.pop("api_mode", None)  # let runtime auto-detect from URL
         save_config(cfg)
         deactivate_provider()
 
@@ -2125,7 +2147,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         api_key_for_probe = existing_key or (get_env_value(key_env) if key_env else "")
         live_models = fetch_api_models(api_key_for_probe, effective_base)
 
-    if live_models:
+    if live_models and len(live_models) >= len(curated):
         model_list = live_models
         print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
     else:
@@ -2158,7 +2180,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
             cfg["model"] = model
         model["provider"] = provider_id
         model["base_url"] = effective_base
-        model["api_mode"] = "chat_completions"
+        model.pop("api_mode", None)  # let runtime auto-detect from URL
         save_config(cfg)
         deactivate_provider()
 
@@ -2457,8 +2479,37 @@ def cmd_version(args):
 
 def cmd_uninstall(args):
     """Uninstall Hermes Agent."""
+    _require_tty("uninstall")
     from hermes_cli.uninstall import run_uninstall
     run_uninstall(args)
+
+
+def _clear_bytecode_cache(root: Path) -> int:
+    """Remove all __pycache__ directories under *root*.
+
+    Stale .pyc files can cause ImportError after code updates when Python
+    loads a cached bytecode file that references names that no longer exist
+    (or don't yet exist) in the updated source.  Clearing them forces Python
+    to recompile from the .py source on next import.
+
+    Returns the number of directories removed.
+    """
+    removed = 0
+    for dirpath, dirnames, _ in os.walk(root):
+        # Skip venv / node_modules / .git entirely
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in ("venv", ".venv", "node_modules", ".git", ".worktrees")
+        ]
+        if os.path.basename(dirpath) == "__pycache__":
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(dirpath)
+                removed += 1
+            except OSError:
+                pass
+            dirnames.clear()  # nothing left to recurse into
+    return removed
 
 
 def _update_via_zip(args):
@@ -2502,7 +2553,7 @@ def _update_via_zip(args):
                     break
         
         # Copy updated files over existing installation, preserving venv/node_modules/.git
-        preserve = {'venv', 'node_modules', '.git', '__pycache__', '.env'}
+        preserve = {'venv', 'node_modules', '.git', '.env'}
         update_count = 0
         for item in os.listdir(extracted):
             if item in preserve:
@@ -2525,6 +2576,11 @@ def _update_via_zip(args):
     except Exception as e:
         print(f"✗ ZIP update failed: {e}")
         sys.exit(1)
+
+    # Clear stale bytecode after ZIP extraction
+    removed = _clear_bytecode_cache(PROJECT_ROOT)
+    if removed:
+        print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
     
     # Reinstall Python dependencies (try .[all] first for optional extras,
     # fall back to . if extras fail — mirrors the install script behavior)
@@ -2923,6 +2979,13 @@ def cmd_update(args):
                     )
         
         _invalidate_update_cache()
+
+        # Clear stale .pyc bytecode cache — prevents ImportError on gateway
+        # restart when updated source references names that didn't exist in
+        # the old bytecode (e.g. get_hermes_home added to hermes_constants).
+        removed = _clear_bytecode_cache(PROJECT_ROOT)
+        if removed:
+            print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
         
         # Reinstall Python dependencies (try .[all] first for optional extras,
         # fall back to . if extras fail — mirrors the install script behavior)
@@ -4089,6 +4152,7 @@ For more help on a command:
     def cmd_skills(args):
         # Route 'config' action to skills_config module
         if getattr(args, 'skills_action', None) == 'config':
+            _require_tty("skills config")
             from hermes_cli.skills_config import skills_command as skills_config_command
             skills_config_command(args)
         else:
@@ -4299,6 +4363,7 @@ For more help on a command:
             from hermes_cli.tools_config import tools_disable_enable_command
             tools_disable_enable_command(args)
         else:
+            _require_tty("tools")
             from hermes_cli.tools_config import tools_command
             tools_command(args)
 
