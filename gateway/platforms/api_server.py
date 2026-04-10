@@ -24,6 +24,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -299,6 +300,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
+        self._model_name: str = self._resolve_model_name(
+            extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -323,6 +327,26 @@ class APIServerAdapter(BasePlatformAdapter):
             items = [str(value)]
 
         return tuple(str(item).strip() for item in items if str(item).strip())
+
+    @staticmethod
+    def _resolve_model_name(explicit: str) -> str:
+        """Derive the advertised model name for /v1/models.
+
+        Priority:
+        1. Explicit override (config extra or API_SERVER_MODEL_NAME env var)
+        2. Active profile name (so each profile advertises a distinct model)
+        3. Fallback: "hermes-agent"
+        """
+        if explicit and explicit.strip():
+            return explicit.strip()
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+            if profile and profile not in ("default", "custom"):
+                return profile
+        except Exception:
+            pass
+        return "hermes-agent"
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -468,12 +492,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": [
                 {
-                    "id": "hermes-agent",
+                    "id": self._model_name,
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "hermes",
                     "permission": [],
-                    "root": "hermes-agent",
+                    "root": self._model_name,
                     "parent": None,
                 }
             ],
@@ -531,8 +555,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
+        #
+        # Security: session continuation exposes conversation history, so it is
+        # only allowed when the API key is configured and the request is
+        # authenticated.  Without this gate, any unauthenticated client could
+        # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
+            if not self._api_key:
+                logger.warning(
+                    "Session continuation via X-Hermes-Session-Id rejected: "
+                    "no API key configured.  Set API_SERVER_KEY to enable "
+                    "session continuity."
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation requires API key authentication. "
+                        "Configure API_SERVER_KEY to enable this feature."
+                    ),
+                    status=403,
+                )
+            # Sanitize: reject control characters that could enable header injection.
+            if re.search(r'[\r\n\x00]', provided_session_id):
+                return web.json_response(
+                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                    status=400,
+                )
             session_id = provided_session_id
             try:
                 db = self._ensure_session_db()
@@ -546,7 +594,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", "hermes-agent")
+        model_name = body.get("model", self._model_name)
         created = int(time.time())
 
         if stream:
@@ -923,7 +971,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "status": "completed",
             "created_at": created_at,
-            "model": body.get("model", "hermes-agent"),
+            "model": body.get("model", self._model_name),
             "output": output_items,
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
@@ -1652,9 +1700,17 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._site.start()
 
             self._mark_connected()
+            if not self._api_key:
+                logger.warning(
+                    "[%s] ⚠️  No API key configured (API_SERVER_KEY / platforms.api_server.key). "
+                    "All requests will be accepted without authentication. "
+                    "Set an API key for production deployments to prevent "
+                    "unauthorized access to sessions, responses, and cron jobs.",
+                    self.name,
+                )
             logger.info(
-                "[%s] API server listening on http://%s:%d",
-                self.name, self._host, self._port,
+                "[%s] API server listening on http://%s:%d (model: %s)",
+                self.name, self._host, self._port, self._model_name,
             )
             return True
 

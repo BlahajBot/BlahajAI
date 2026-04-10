@@ -170,6 +170,7 @@ def _run_with_agent(monkeypatch, agent_cls):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
+    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
@@ -278,6 +279,7 @@ def test_build_api_kwargs_typeerror_does_not_crash_with_unboundlocal(monkeypatch
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
+    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
@@ -376,6 +378,7 @@ def test_401_credential_refresh_recovers(monkeypatch):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
+    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
@@ -449,6 +452,7 @@ def test_401_refresh_fails_is_non_retryable(monkeypatch):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
+    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
@@ -537,6 +541,7 @@ def test_prompt_too_long_triggers_compression(monkeypatch):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
+    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
