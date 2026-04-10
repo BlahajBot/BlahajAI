@@ -542,6 +542,7 @@ DEFAULT_CONFIG = {
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
+        "register_skill_commands": True,  # Register skills as native Discord app commands
     },
 
     # WhatsApp platform settings (gateway mode)

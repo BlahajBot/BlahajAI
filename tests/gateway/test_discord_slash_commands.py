@@ -51,6 +51,12 @@ class FakeTree:
 
         return decorator
 
+    def get_commands(self):
+        return [SimpleNamespace(name=name) for name in self.commands]
+
+    def add_command(self, cmd):
+        self.commands[cmd.name] = cmd.callback
+
 
 @pytest.fixture
 def adapter():
@@ -497,3 +503,37 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+
+
+def test_discord_register_skill_commands_config_bridge(monkeypatch, tmp_path):
+    """discord.register_skill_commands should bridge to DISCORD_REGISTER_SKILL_COMMANDS."""
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    config_path = hermes_dir / "config.yaml"
+    config_path.write_text(yaml.dump({
+        "discord": {"register_skill_commands": False},
+    }))
+
+    monkeypatch.delenv("DISCORD_REGISTER_SKILL_COMMANDS", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    import os
+    assert os.getenv("DISCORD_REGISTER_SKILL_COMMANDS") == "false"
+
+
+def test_register_slash_commands_skips_skill_registration_when_disabled(adapter, monkeypatch):
+    """Disabling native skill registration should leave built-in slash commands intact."""
+    monkeypatch.setenv("DISCORD_REGISTER_SKILL_COMMANDS", "false")
+
+    with patch("hermes_cli.commands.discord_skill_commands") as mock_skill_commands:
+        adapter._register_slash_commands()
+
+    assert "thread" in adapter._client.tree.commands
+    mock_skill_commands.assert_not_called()

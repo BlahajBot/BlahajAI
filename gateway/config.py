@@ -575,6 +575,8 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
                     os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+                if "register_skill_commands" in discord_cfg and not os.getenv("DISCORD_REGISTER_SKILL_COMMANDS"):
+                    os.environ["DISCORD_REGISTER_SKILL_COMMANDS"] = str(discord_cfg["register_skill_commands"]).lower()
                 # ignored_channels: channels where bot never responds (even when mentioned)
                 ic = discord_cfg.get("ignored_channels")
                 if ic is not None and not os.getenv("DISCORD_IGNORED_CHANNELS"):
