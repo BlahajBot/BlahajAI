@@ -40,7 +40,7 @@ class TestHandleFunctionCall:
         assert len(parsed["error"]) > 0
         assert "error" in parsed["error"].lower() or "failed" in parsed["error"].lower()
 
-    def test_tool_hooks_receive_session_and_tool_call_ids(self):
+    def test_tool_hooks_receive_task_id(self):
         with (
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
             patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
@@ -49,8 +49,6 @@ class TestHandleFunctionCall:
                 "web_search",
                 {"q": "test"},
                 task_id="task-1",
-                tool_call_id="call-1",
-                session_id="session-1",
             )
 
         assert result == '{"ok":true}'
@@ -60,8 +58,6 @@ class TestHandleFunctionCall:
                 tool_name="web_search",
                 args={"q": "test"},
                 task_id="task-1",
-                session_id="session-1",
-                tool_call_id="call-1",
             ),
             call(
                 "post_tool_call",
@@ -69,8 +65,6 @@ class TestHandleFunctionCall:
                 args={"q": "test"},
                 result='{"ok":true}',
                 task_id="task-1",
-                session_id="session-1",
-                tool_call_id="call-1",
             ),
         ]
 

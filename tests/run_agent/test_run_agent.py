@@ -1374,10 +1374,7 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
                 "web_search", {"q": "test"}, "task-1",
-                tool_call_id=None,
-                session_id=agent.session_id,
                 enabled_tools=list(agent.valid_tool_names),
-
             )
             assert result == "result"
 
