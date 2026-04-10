@@ -238,6 +238,77 @@ def test_400_bad_request_is_non_retryable(monkeypatch):
     assert "400" in str(result.get("final_response", ""))
 
 
+def test_build_api_kwargs_typeerror_does_not_crash_with_unboundlocal(monkeypatch):
+    """Request-build failures should surface once, not cascade into UnboundLocalError."""
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.build_anthropic_client", _fake_build_anthropic_client
+    )
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
+
+    class _BuildKwargsTypeErrorAgent(run_agent.AIAgent):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("skip_context_files", True)
+            kwargs.setdefault("skip_memory", True)
+            kwargs.setdefault("max_iterations", 4)
+            super().__init__(*args, **kwargs)
+            self._cleanup_task_resources = lambda task_id: None
+            self._persist_session = lambda messages, history=None: None
+            self._save_trajectory = lambda messages, user_message, completed: None
+            self._save_session_log = lambda messages: None
+
+        def _build_api_kwargs(self, api_messages):
+            raise TypeError("build_anthropic_kwargs() got an unexpected keyword argument 'base_url'")
+
+    monkeypatch.setattr(run_agent, "AIAgent", _BuildKwargsTypeErrorAgent)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-api03-test-key",
+        },
+    )
+
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._running_agents = {}
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.hooks.loaded_hooks = []
+    runner._session_db = None
+
+    source = SessionSource(
+        platform=Platform.LOCAL,
+        chat_id="cli",
+        chat_name="CLI",
+        chat_type="dm",
+        user_id="test-user-1",
+    )
+
+    result = asyncio.run(
+        runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-build-kwargs-typeerror",
+            session_key="agent:main:local:dm",
+        )
+    )
+
+    response_text = str(result.get("final_response", ""))
+    assert "unexpected keyword argument 'base_url'" in response_text
+    assert "UnboundLocalError" not in response_text
+
+
 def test_500_server_error_is_retried_and_recovers(monkeypatch):
     """500 should be retried with backoff. First call fails, second succeeds."""
     agent_cls = _make_agent_cls(_ServerError, recover_after=1)
