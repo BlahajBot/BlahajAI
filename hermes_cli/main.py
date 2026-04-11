@@ -97,10 +97,11 @@ def _apply_profile_override() -> None:
             consume = 1
             break
 
-    # 2. If no flag, check ~/.hermes/active_profile
+    # 2. If no flag, check active_profile in the hermes root
     if profile_name is None:
         try:
-            active_path = Path.home() / ".hermes" / "active_profile"
+            from hermes_constants import get_default_hermes_root
+            active_path = get_default_hermes_root() / "active_profile"
             if active_path.exists():
                 name = active_path.read_text().strip()
                 if name and name != "default":
@@ -933,6 +934,7 @@ def select_provider_and_model(args=None):
         "kilocode": "Kilo Code",
         "alibaba": "Alibaba Cloud (DashScope)",
         "huggingface": "Hugging Face",
+        "xiaomi": "Xiaomi MiMo",
         "custom": "Custom endpoint",
     }
     active_label = provider_labels.get(active, active) if active else "none"
@@ -965,6 +967,7 @@ def select_provider_and_model(args=None):
         ("opencode-go", "OpenCode Go (open models, $10/month subscription)"),
         ("ai-gateway", "AI Gateway (Vercel — 200+ models, pay-per-use)"),
         ("alibaba", "Alibaba Cloud / DashScope Coding (Qwen + multi-provider)"),
+        ("xiaomi", "Xiaomi MiMo (MiMo-V2 models — pro, omni, flash)"),
     ]
 
     def _named_custom_provider_map(cfg) -> dict[str, dict[str, str]]:
@@ -1076,8 +1079,44 @@ def select_provider_and_model(args=None):
         _model_flow_anthropic(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
-    elif selected_provider in ("gemini", "zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface"):
+    elif selected_provider in ("gemini", "zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface", "xiaomi"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
+
+    # ── Post-switch cleanup: clear stale OPENAI_BASE_URL ──────────────
+    # When the user switches to a named provider (anything except "custom"),
+    # a leftover OPENAI_BASE_URL in ~/.hermes/.env can poison auxiliary
+    # clients that use provider:auto. Clear it proactively.  (#5161)
+    if selected_provider not in ("custom", "cancel", "remove-custom") \
+            and not selected_provider.startswith("custom:"):
+        _clear_stale_openai_base_url()
+
+
+def _clear_stale_openai_base_url():
+    """Remove OPENAI_BASE_URL from ~/.hermes/.env if the active provider is not 'custom'.
+
+    After a provider switch, a leftover OPENAI_BASE_URL causes auxiliary
+    clients (compression, vision, delegation) with provider:auto to route
+    requests to the old custom endpoint instead of the newly selected
+    provider.  See issue #5161.
+    """
+    from hermes_cli.config import get_env_value, save_env_value, load_config
+
+    cfg = load_config()
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, dict):
+        provider = (model_cfg.get("provider") or "").strip().lower()
+    else:
+        provider = ""
+
+    if provider == "custom" or not provider:
+        return  # custom provider legitimately uses OPENAI_BASE_URL
+
+    stale_url = get_env_value("OPENAI_BASE_URL")
+    if stale_url:
+        save_env_value("OPENAI_BASE_URL", "")
+        print(f"Cleared stale OPENAI_BASE_URL from .env (was: {stale_url[:40]}...)"
+              if len(stale_url) > 40
+              else f"Cleared stale OPENAI_BASE_URL from .env (was: {stale_url})")
 
 
 def _prompt_provider_choice(choices, *, default=0):
@@ -1672,6 +1711,8 @@ def _remove_custom_provider(config):
             title="Select provider to remove:",
         )
         idx = menu.show()
+        from hermes_cli.curses_ui import flush_stdin
+        flush_stdin()
         print()
     except (ImportError, NotImplementedError, OSError, subprocess.SubprocessError):
         for i, c in enumerate(choices, 1):
@@ -1697,8 +1738,9 @@ def _remove_custom_provider(config):
 def _model_flow_named_custom(config, provider_info):
     """Handle a named custom provider from config.yaml custom_providers list.
 
-    If the entry has a saved model name, activates it immediately.
-    Otherwise probes the endpoint's /models API to let the user pick one.
+    Always probes the endpoint's /models API to let the user pick a model.
+    If a model was previously saved, it is pre-selected in the menu.
+    Falls back to the saved model if probing fails.
     """
     from hermes_cli.auth import _save_model_choice, deactivate_provider
     from hermes_cli.config import load_config, save_config
@@ -1709,46 +1751,37 @@ def _model_flow_named_custom(config, provider_info):
     api_key = provider_info.get("api_key", "")
     saved_model = provider_info.get("model", "")
 
-    # If a model is saved, just activate immediately — no probing needed
-    if saved_model:
-        _save_model_choice(saved_model)
-
-        cfg = load_config()
-        model = cfg.get("model")
-        if not isinstance(model, dict):
-            model = {"default": model} if model else {}
-            cfg["model"] = model
-        model["provider"] = "custom"
-        model["base_url"] = base_url
-        if api_key:
-            model["api_key"] = api_key
-        save_config(cfg)
-        deactivate_provider()
-
-        print(f"✅ Switched to: {saved_model}")
-        print(f"   Provider: {name} ({base_url})")
-        return
-
-    # No saved model — probe endpoint and let user pick
     print(f"  Provider: {name}")
     print(f"  URL:      {base_url}")
+    if saved_model:
+        print(f"  Current:  {saved_model}")
     print()
-    print("No model saved for this provider. Fetching available models...")
+
+    print("Fetching available models...")
     models = fetch_api_models(api_key, base_url, timeout=8.0)
 
     if models:
+        default_idx = 0
+        if saved_model and saved_model in models:
+            default_idx = models.index(saved_model)
+
         print(f"Found {len(models)} model(s):\n")
         try:
             from simple_term_menu import TerminalMenu
-            menu_items = [f"  {m}" for m in models] + ["  Cancel"]
+            menu_items = [
+                f"  {m} (current)" if m == saved_model else f"  {m}"
+                for m in models
+            ] + ["  Cancel"]
             menu = TerminalMenu(
-                menu_items, cursor_index=0,
+                menu_items, cursor_index=default_idx,
                 menu_cursor="-> ", menu_cursor_style=("fg_green", "bold"),
                 menu_highlight_style=("fg_green",),
                 cycle_cursor=True, clear_screen=False,
                 title=f"Select model from {name}:",
             )
             idx = menu.show()
+            from hermes_cli.curses_ui import flush_stdin
+            flush_stdin()
             print()
             if idx is None or idx >= len(models):
                 print("Cancelled.")
@@ -1756,7 +1789,8 @@ def _model_flow_named_custom(config, provider_info):
             model_name = models[idx]
         except (ImportError, NotImplementedError, OSError, subprocess.SubprocessError):
             for i, m in enumerate(models, 1):
-                print(f"  {i}. {m}")
+                suffix = " (current)" if m == saved_model else ""
+                print(f"  {i}. {m}{suffix}")
             print(f"  {len(models) + 1}. Cancel")
             print()
             try:
@@ -1772,6 +1806,13 @@ def _model_flow_named_custom(config, provider_info):
             except (ValueError, KeyboardInterrupt, EOFError):
                 print("\nCancelled.")
                 return
+    elif saved_model:
+        print("Could not fetch models from endpoint.")
+        try:
+            model_name = input(f"Model name [{saved_model}]: ").strip() or saved_model
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            return
     else:
         print("Could not fetch models from endpoint. Enter model name manually.")
         try:
@@ -1867,6 +1908,8 @@ def _prompt_reasoning_effort_selection(efforts, current_effort=""):
             title="Select reasoning effort:",
         )
         idx = menu.show()
+        from hermes_cli.curses_ui import flush_stdin
+        flush_stdin()
         if idx is None:
             return None
         print()
@@ -3309,10 +3352,11 @@ def _invalidate_update_cache():
     ``hermes update``, every profile is now current.
     """
     homes = []
-    # Default profile home
-    default_home = Path.home() / ".hermes"
+    # Default profile home (Docker-aware — uses /opt/data in Docker)
+    from hermes_constants import get_default_hermes_root
+    default_home = get_default_hermes_root()
     homes.append(default_home)
-    # Named profiles under ~/.hermes/profiles/
+    # Named profiles under <root>/profiles/
     profiles_root = default_home / "profiles"
     if profiles_root.is_dir():
         for entry in profiles_root.iterdir():
@@ -4049,7 +4093,10 @@ def cmd_profile(args):
             print(f"  {name} chat               Start chatting")
             print(f"  {name} gateway start      Start the messaging gateway")
             if clone or clone_all:
-                profile_dir_display = f"~/.hermes/profiles/{name}"
+                try:
+                    profile_dir_display = "~/" + str(profile_dir.relative_to(Path.home()))
+                except ValueError:
+                    profile_dir_display = str(profile_dir)
                 print(f"\n  Edit {profile_dir_display}/.env for different API keys")
                 print(f"  Edit {profile_dir_display}/SOUL.md for different personality")
             print()
@@ -4312,7 +4359,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "gemini", "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "gemini", "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "xiaomi"],
         default=None,
         help="Inference provider (default: auto)"
     )
@@ -4438,7 +4485,7 @@ For more help on a command:
     gateway_subparsers = gateway_parser.add_subparsers(dest="gateway_command")
     
     # gateway run (default)
-    gateway_run = gateway_subparsers.add_parser("run", help="Run gateway in foreground")
+    gateway_run = gateway_subparsers.add_parser("run", help="Run gateway in foreground (recommended for WSL, Docker, Termux)")
     gateway_run.add_argument("-v", "--verbose", action="count", default=0,
                              help="Increase stderr log verbosity (-v=INFO, -vv=DEBUG)")
     gateway_run.add_argument("-q", "--quiet", action="store_true",
@@ -4447,7 +4494,7 @@ For more help on a command:
                              help="Replace any existing gateway instance (useful for systemd)")
     
     # gateway start
-    gateway_start = gateway_subparsers.add_parser("start", help="Start gateway service")
+    gateway_start = gateway_subparsers.add_parser("start", help="Start the installed systemd/launchd background service")
     gateway_start.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
     
     # gateway stop
@@ -4465,7 +4512,7 @@ For more help on a command:
     gateway_status.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
     
     # gateway install
-    gateway_install = gateway_subparsers.add_parser("install", help="Install gateway as service")
+    gateway_install = gateway_subparsers.add_parser("install", help="Install gateway as a systemd/launchd background service")
     gateway_install.add_argument("--force", action="store_true", help="Force reinstall")
     gateway_install.add_argument("--system", action="store_true", help="Install as a Linux system-level service (starts at boot)")
     gateway_install.add_argument("--run-as-user", dest="run_as_user", help="User account the Linux system service should run as")
@@ -5366,7 +5413,8 @@ For more help on a command:
     claw_migrate = claw_subparsers.add_parser(
         "migrate",
         help="Migrate from OpenClaw to Hermes",
-        description="Import settings, memories, skills, and API keys from an OpenClaw installation"
+        description="Import settings, memories, skills, and API keys from an OpenClaw installation. "
+                    "Always shows a preview before making changes."
     )
     claw_migrate.add_argument(
         "--source",
@@ -5375,7 +5423,7 @@ For more help on a command:
     claw_migrate.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview what would be migrated without making changes"
+        help="Preview only — stop after showing what would be migrated"
     )
     claw_migrate.add_argument(
         "--preset",
