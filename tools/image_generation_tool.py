@@ -854,11 +854,13 @@ from tools.registry import registry, tool_error
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts, optionally with a "
-        "single input image when the configured backend supports it. The underlying "
-        "backend (FAL, OpenAI, etc.) and model are user-configured and not "
-        "selectable by the agent. Returns either a URL or an absolute file "
-        "path in the `image` field; display it with markdown "
+        "Generate new images from text, or edit/transform/restyle a single "
+        "attached image when `input_image` is provided. Use `input_image` for "
+        "requests like edit this image, change the background/outfit/style, "
+        "preserve the subject/composition, or use this as a reference. The "
+        "underlying backend (FAL, OpenAI, etc.) and model are user-configured "
+        "and not selectable by the agent. Returns either a URL or an absolute "
+        "file path in the `image` field; display it with markdown "
         "![description](url-or-path) and the gateway will deliver it."
     ),
     "parameters": {
@@ -876,7 +878,7 @@ IMAGE_GENERATE_SCHEMA = {
             },
             "input_image": {
                 "type": "string",
-                "description": "Optional reference/input image as an absolute path, HTTP(S) URL, or data:image URL. Supported by the openai-codex backend; unsupported backends may return an error.",
+                "description": "Optional source/reference image for editing, transforming, restyling, or preserving details from an attached image. Provide an absolute path, HTTP(S) URL, or data:image URL. Supported by the openai-codex backend; unsupported backends may return an error.",
             },
         },
         "required": ["prompt"],

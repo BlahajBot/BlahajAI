@@ -369,6 +369,14 @@ class TestRegistryIntegration:
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
         assert set(props.keys()) == {"prompt", "aspect_ratio", "input_image"}
 
+    def test_schema_wording_guides_image_editing_use(self, image_tool):
+        schema = image_tool.IMAGE_GENERATE_SCHEMA
+        input_desc = schema["parameters"]["properties"]["input_image"]["description"]
+        combined = f"{schema['description']} {input_desc}".lower()
+
+        for word in ("edit", "transform", "restyle", "attached image"):
+            assert word in combined
+
     def test_aspect_ratio_enum_is_three_values(self, image_tool):
         enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]
         assert set(enum) == {"landscape", "square", "portrait"}
