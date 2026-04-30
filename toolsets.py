@@ -65,6 +65,17 @@ _HERMES_CORE_TOOLS = [
 ]
 
 
+_HERMES_CRON_EXCLUDED_TOOLS = {
+    # Cron jobs run unattended; they cannot ask follow-up questions.
+    "clarify",
+    # Cron-run sessions must not recursively schedule or mutate cron jobs.
+    "cronjob",
+    # Delivery is handled by the scheduler after the final response.
+    "send_message",
+}
+_HERMES_CRON_TOOLS = [tool for tool in _HERMES_CORE_TOOLS if tool not in _HERMES_CRON_EXCLUDED_TOOLS]
+
+
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
@@ -304,6 +315,12 @@ TOOLSETS = {
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-cron": {
+        "description": "Scheduled cron job toolset - autonomous tools without interactive clarification, recursive cron management, or direct messaging",
+        "tools": _HERMES_CRON_TOOLS,
         "includes": []
     },
     
