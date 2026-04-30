@@ -854,7 +854,8 @@ from tools.registry import registry, tool_error
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts. The underlying "
+        "Generate high-quality images from text prompts, optionally with a "
+        "single input image when the configured backend supports it. The underlying "
         "backend (FAL, OpenAI, etc.) and model are user-configured and not "
         "selectable by the agent. Returns either a URL or an absolute file "
         "path in the `image` field; display it with markdown "
@@ -872,6 +873,10 @@ IMAGE_GENERATE_SCHEMA = {
                 "enum": list(VALID_ASPECT_RATIOS),
                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
                 "default": DEFAULT_ASPECT_RATIO,
+            },
+            "input_image": {
+                "type": "string",
+                "description": "Optional reference/input image as an absolute path, HTTP(S) URL, or data:image URL. Supported by the openai-codex backend; unsupported backends may return an error.",
             },
         },
         "required": ["prompt"],
@@ -900,7 +905,7 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, *, input_image: str | None = None):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -949,8 +954,9 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
             "error_type": "provider_not_registered",
         })
 
+    provider_kwargs = {"input_image": input_image} if input_image else {}
     try:
-        result = provider.generate(prompt=prompt, aspect_ratio=aspect_ratio)
+        result = provider.generate(prompt=prompt, aspect_ratio=aspect_ratio, **provider_kwargs)
     except Exception as exc:
         logger.warning(
             "Image gen provider '%s' raised: %s",
@@ -977,12 +983,19 @@ def _handle_image_generate(args, **kw):
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    input_image = args.get("input_image")
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, input_image=input_image)
     if dispatched is not None:
         return dispatched
+
+    if input_image:
+        return tool_error(
+            "input_image is only supported by configured plugin image backends "
+            "such as openai-codex; the built-in FAL path cannot use it."
+        )
 
     return image_generate_tool(
         prompt=prompt,

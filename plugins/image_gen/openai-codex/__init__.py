@@ -19,7 +19,10 @@ Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
 
 from __future__ import annotations
 
+import base64
 import logging
+import mimetypes
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -161,9 +164,45 @@ def _build_codex_client():
         return None
 
 
-def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) -> Optional[str]:
+def _coerce_input_image_url(input_image: Any) -> Optional[str]:
+    """Return an ``input_image.image_url`` value from a URL, data URL, or path."""
+    if input_image is None:
+        return None
+    if not isinstance(input_image, str):
+        raise ValueError("input_image must be a string path, URL, or data:image URL")
+
+    value = input_image.strip()
+    if not value:
+        return None
+
+    lower = value.lower()
+    if lower.startswith(("http://", "https://", "data:image/")):
+        return value
+
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise ValueError(f"input_image path does not exist: {value}")
+
+    mime, _ = mimetypes.guess_type(str(path))
+    if not (mime and mime.startswith("image/")):
+        mime = "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _collect_image_b64(
+    client: Any,
+    *,
+    prompt: str,
+    size: str,
+    quality: str,
+    input_image: Optional[str] = None,
+) -> Optional[str]:
     """Stream a Codex Responses image_generation call and return the b64 image."""
     image_b64: Optional[str] = None
+    content: List[Dict[str, str]] = [{"type": "input_text", "text": prompt}]
+    if input_image:
+        content.append({"type": "input_image", "image_url": input_image})
 
     with client.responses.stream(
         model=_CODEX_CHAT_MODEL,
@@ -172,7 +211,7 @@ def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) -> 
         input=[{
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
+            "content": content,
         }],
         tools=[{
             "type": "image_generation",
@@ -306,6 +345,17 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
 
         tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
+        try:
+            input_image = _coerce_input_image_url(kwargs.get("input_image"))
+        except ValueError as exc:
+            return error_response(
+                error=str(exc),
+                error_type="invalid_argument",
+                provider="openai-codex",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
 
         client = _build_codex_client()
         if client is None:
@@ -324,6 +374,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 prompt=prompt,
                 size=size,
                 quality=meta["quality"],
+                input_image=input_image,
             )
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
@@ -364,7 +415,11 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             prompt=prompt,
             aspect_ratio=aspect,
             provider="openai-codex",
-            extra={"size": size, "quality": meta["quality"]},
+            extra={
+                "size": size,
+                "quality": meta["quality"],
+                "input_image": bool(input_image),
+            },
         )
 
 
