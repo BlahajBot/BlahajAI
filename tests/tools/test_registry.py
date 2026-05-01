@@ -291,10 +291,10 @@ class TestCheckFnExceptionHandling:
 class TestBuiltinDiscovery:
     def test_matches_previous_manual_builtin_tool_set(self):
         expected = {
-            "tools.brave_search_tool",
             "tools.browser_cdp_tool",
             "tools.browser_dialog_tool",
             "tools.browser_tool",
+            "tools.brave_search_tool",
             "tools.clarify_tool",
             "tools.code_execution_tool",
             "tools.cronjob_tools",
@@ -305,6 +305,7 @@ class TestBuiltinDiscovery:
             "tools.file_tools",
             "tools.homeassistant_tool",
             "tools.image_generation_tool",
+            "tools.kanban_tools",
             "tools.memory_tool",
             "tools.mixture_of_agents_tool",
             "tools.process_registry",
