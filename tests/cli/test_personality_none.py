@@ -48,13 +48,24 @@ class TestCLIPersonalityNone:
         cli = self._make_cli()
         with patch("cli.save_config_value", return_value=True) as mock_save:
             cli._handle_personality_command("/personality none")
-        mock_save.assert_called_once_with("agent.system_prompt", "")
+        mock_save.assert_any_call("agent.system_prompt", "")
+        mock_save.assert_any_call("display.personality", "none")
 
     def test_known_personality_still_works(self):
         cli = self._make_cli()
         with patch("cli.save_config_value", return_value=True):
             cli._handle_personality_command("/personality helpful")
-        assert cli.system_prompt == "You are helpful."
+        assert "ACTIVE PERSONALITY OVERRIDE (helpful)" in cli.system_prompt
+        assert "You are helpful." in cli.system_prompt
+
+    def test_known_personality_saves_display_selection(self):
+        cli = self._make_cli()
+        with patch("cli.save_config_value", return_value=True) as mock_save:
+            cli._handle_personality_command("/personality helpful")
+        saved_prompt = next(call.args[1] for call in mock_save.call_args_list if call.args[0] == "agent.system_prompt")
+        assert "ACTIVE PERSONALITY OVERRIDE (helpful)" in saved_prompt
+        assert "You are helpful." in saved_prompt
+        mock_save.assert_any_call("display.personality", "helpful")
 
     def test_unknown_personality_shows_none_in_available(self, capsys):
         cli = self._make_cli()
@@ -104,6 +115,9 @@ class TestGatewayPersonalityNone:
 
         assert runner._ephemeral_system_prompt == ""
         assert "cleared" in result.lower()
+        saved = yaml.safe_load(config_file.read_text())
+        assert saved["agent"]["system_prompt"] == ""
+        assert saved["display"]["personality"] == "none"
 
     @pytest.mark.asyncio
     async def test_default_clears_ephemeral_prompt(self, tmp_path):
@@ -117,6 +131,25 @@ class TestGatewayPersonalityNone:
             result = await runner._handle_personality_command(event)
 
         assert runner._ephemeral_system_prompt == ""
+
+    @pytest.mark.asyncio
+    async def test_known_personality_saves_display_selection(self, tmp_path):
+        runner = self._make_runner()
+        config_data = {"agent": {"personalities": {"helpful": "You are helpful."}}}
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.dump(config_data))
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            event = self._make_event("helpful")
+            result = await runner._handle_personality_command(event)
+
+        assert "ACTIVE PERSONALITY OVERRIDE (helpful)" in runner._ephemeral_system_prompt
+        assert "You are helpful." in runner._ephemeral_system_prompt
+        assert "helpful" in result.lower()
+        saved = yaml.safe_load(config_file.read_text())
+        assert "ACTIVE PERSONALITY OVERRIDE (helpful)" in saved["agent"]["system_prompt"]
+        assert "You are helpful." in saved["agent"]["system_prompt"]
+        assert saved["display"]["personality"] == "helpful"
 
     @pytest.mark.asyncio
     async def test_list_includes_none(self, tmp_path):
@@ -208,7 +241,8 @@ class TestPersonalityDictFormat:
         cli = self._make_cli({"helper": "You are helpful."})
         with patch("cli.save_config_value", return_value=True):
             cli._handle_personality_command("/personality helper")
-        assert cli.system_prompt == "You are helpful."
+        assert "ACTIVE PERSONALITY OVERRIDE (helper)" in cli.system_prompt
+        assert "You are helpful." in cli.system_prompt
 
     def test_resolve_prompt_dict_no_tone_no_style(self):
         from cli import HermesCLI

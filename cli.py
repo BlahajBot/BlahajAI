@@ -2156,11 +2156,15 @@ class HermesCLI:
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
         
-        # Ephemeral system prompt: env var takes precedence, then config
-        self.system_prompt = (
-            os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
-            or CLI_CONFIG["agent"].get("system_prompt", "")
-        )
+        # Ephemeral system prompt: env var takes precedence, then config.
+        # When the prompt came from a selected /personality, wrap it as an
+        # explicit persona/style override so it wins over SOUL.md, memory, and
+        # prior chat style without rewriting any cached/stored conversation.
+        env_system_prompt = os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
+        self.system_prompt = env_system_prompt or CLI_CONFIG["agent"].get("system_prompt", "")
+        selected_personality = str(CLI_CONFIG.get("display", {}).get("personality", "") or "").strip().lower()
+        if self.system_prompt and not env_system_prompt and selected_personality not in ("", "none", "default", "neutral"):
+            self.system_prompt = self._wrap_personality_prompt(selected_personality, self.system_prompt)
         self.personalities = CLI_CONFIG["agent"].get("personalities", {})
         
         # Ephemeral prefill messages (few-shot priming, never persisted)
@@ -5817,6 +5821,22 @@ class HermesCLI:
             return "\n".join(p for p in parts if p)
         return str(value)
 
+    @staticmethod
+    def _wrap_personality_prompt(name: str, prompt: str) -> str:
+        """Make a selected personality authoritative without touching cached history."""
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return ""
+        if "ACTIVE PERSONALITY OVERRIDE" in prompt:
+            return prompt
+        return (
+            f"ACTIVE PERSONALITY OVERRIDE ({name}):\n"
+            "For tone, persona, voice, and stylistic behavior, follow the personality instructions below. "
+            "They override earlier persona/tone instructions from SOUL.md, memory, user profile, and prior conversation. "
+            "Do not override safety rules, tool-use requirements, platform formatting constraints, or the user's task instructions.\n\n"
+            f"{prompt}"
+        )
+
     def _handle_gquota_command(self, cmd_original: str) -> None:
         """Show Google Gemini Code Assist quota usage for the current OAuth account."""
         try:
@@ -5874,15 +5894,22 @@ class HermesCLI:
             if personality_name in ("none", "default", "neutral"):
                 self.system_prompt = ""
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", ""):
+                saved_prompt = save_config_value("agent.system_prompt", "")
+                saved_display = save_config_value("display.personality", "none")
+                if saved_prompt and saved_display:
                     print("(^_^)b Personality cleared (saved to config)")
                 else:
                     print("(^_^) Personality cleared (session only)")
                 print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
-                self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
+                self.system_prompt = self._wrap_personality_prompt(
+                    personality_name,
+                    self._resolve_personality_prompt(self.personalities[personality_name]),
+                )
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", self.system_prompt):
+                saved_prompt = save_config_value("agent.system_prompt", self.system_prompt)
+                saved_display = save_config_value("display.personality", personality_name)
+                if saved_prompt and saved_display:
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")

@@ -1675,6 +1675,22 @@ class GatewayRunner:
             return []
 
     @staticmethod
+    def _wrap_personality_prompt(name: str, prompt: str) -> str:
+        """Make a selected personality authoritative without rewriting history."""
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return ""
+        if "ACTIVE PERSONALITY OVERRIDE" in prompt:
+            return prompt
+        return (
+            f"ACTIVE PERSONALITY OVERRIDE ({name}):\n"
+            "For tone, persona, voice, and stylistic behavior, follow the personality instructions below. "
+            "They override earlier persona/tone instructions from SOUL.md, memory, user profile, and prior conversation. "
+            "Do not override safety rules, tool-use requirements, platform formatting constraints, or the user's task instructions.\n\n"
+            f"{prompt}"
+        )
+
+    @staticmethod
     def _load_ephemeral_system_prompt() -> str:
         """Load ephemeral system prompt from config or env var.
         
@@ -1690,7 +1706,11 @@ class GatewayRunner:
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
-                return (cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+                prompt = (cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+                selected = str(cfg_get(cfg, "display", "personality", default="") or "").strip().lower()
+                if prompt and selected not in ("", "none", "default", "neutral"):
+                    return GatewayRunner._wrap_personality_prompt(selected, prompt)
+                return prompt
         except Exception:
             pass
         return ""
@@ -7582,20 +7602,26 @@ class GatewayRunner:
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
+                if "display" not in config or not isinstance(config.get("display"), dict):
+                    config["display"] = {}
                 config["agent"]["system_prompt"] = ""
+                config["display"]["personality"] = "none"
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
             self._ephemeral_system_prompt = ""
             return "🎭 Personality cleared — using base agent behavior.\n_(takes effect on next message)_"
         elif args in personalities:
-            new_prompt = _resolve_prompt(personalities[args])
+            new_prompt = self._wrap_personality_prompt(args, _resolve_prompt(personalities[args]))
 
             # Write to config.yaml, same pattern as CLI save_config_value.
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
+                if "display" not in config or not isinstance(config.get("display"), dict):
+                    config["display"] = {}
                 config["agent"]["system_prompt"] = new_prompt
+                config["display"]["personality"] = args
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
