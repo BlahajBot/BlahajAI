@@ -857,10 +857,12 @@ IMAGE_GENERATE_SCHEMA = {
         "Generate new images from text, or edit/transform/restyle a single "
         "attached image when `input_image` is provided. Use `input_image` for "
         "requests like edit this image, change the background/outfit/style, "
-        "preserve the subject/composition, or use this as a reference. The "
-        "underlying backend (FAL, OpenAI, etc.) and model are user-configured "
-        "and not selectable by the agent. Returns either a URL or an absolute "
-        "file path in the `image` field; display it with markdown "
+        "preserve the subject/composition, or use this as a reference. Use "
+        "`quality` for quick drafts (`low`), balanced output (`medium`), or "
+        "final/high-fidelity renders (`high`) when the configured backend "
+        "supports it. The underlying backend is user-configured. Returns "
+        "either a URL or an absolute file path in the `image` field; display "
+        "it with markdown "
         "![description](url-or-path) and the gateway will deliver it."
     ),
     "parameters": {
@@ -875,6 +877,11 @@ IMAGE_GENERATE_SCHEMA = {
                 "enum": list(VALID_ASPECT_RATIOS),
                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
                 "default": DEFAULT_ASPECT_RATIO,
+            },
+            "quality": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Optional quality tier for image backends that support per-call quality selection. Use low for drafts, medium for balanced output, high for final/high-fidelity renders. Currently supported by openai-codex/openai GPT Image 2 backends.",
             },
             "input_image": {
                 "type": "string",
@@ -922,7 +929,13 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, *, input_image: str | None = None):
+def _dispatch_to_plugin_provider(
+    prompt: str,
+    aspect_ratio: str,
+    *,
+    input_image: str | None = None,
+    quality: str | None = None,
+):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -937,7 +950,27 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, *, input_image:
     if not configured or configured == "fal":
         return None
 
-    # Also read configured model so we can pass it to the plugin.
+    quality_lc = None
+    if quality is not None:
+        if not isinstance(quality, str):
+            return json.dumps({
+                "success": False,
+                "image": None,
+                "error": "quality must be one of: low, medium, high",
+                "error_type": "invalid_argument",
+            })
+        quality_lc = quality.strip().lower()
+        if quality_lc not in {"low", "medium", "high"}:
+            return json.dumps({
+                "success": False,
+                "image": None,
+                "error": "quality must be one of: low, medium, high",
+                "error_type": "invalid_argument",
+            })
+
+    # Also read configured model so we can pass it to the plugin, unless the
+    # caller supplied a per-call quality tier. Per-call quality must override
+    # global config so drafts/finals can use different fidelity in one session.
     configured_model = _read_configured_image_model()
 
     try:
@@ -975,7 +1008,10 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, *, input_image:
         })
 
     provider_kwargs = {}
-    if configured_model:
+    if quality_lc:
+        provider_kwargs["quality"] = quality_lc
+        provider_kwargs["model"] = f"gpt-image-2-{quality_lc}"
+    elif configured_model:
         provider_kwargs["model"] = configured_model
     if input_image:
         provider_kwargs["input_image"] = input_image
@@ -1008,10 +1044,16 @@ def _handle_image_generate(args, **kw):
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
     input_image = args.get("input_image")
+    quality = args.get("quality")
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, input_image=input_image)
+    dispatched = _dispatch_to_plugin_provider(
+        prompt,
+        aspect_ratio,
+        input_image=input_image,
+        quality=quality,
+    )
     if dispatched is not None:
         return dispatched
 
@@ -1019,6 +1061,11 @@ def _handle_image_generate(args, **kw):
         return tool_error(
             "input_image is only supported by configured plugin image backends "
             "such as openai-codex; the built-in FAL path cannot use it."
+        )
+    if quality:
+        return tool_error(
+            "quality is only supported by configured plugin image backends "
+            "such as openai-codex/openai; the built-in FAL path cannot use it."
         )
 
     return image_generate_tool(

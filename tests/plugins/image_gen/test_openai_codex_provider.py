@@ -199,6 +199,67 @@ class TestGenerate:
         assert tool["background"] == "opaque"
         assert tool["partial_images"] == 1
 
+    def test_generate_accepts_per_call_quality_tier(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        captured = {}
+
+        def _stream(**kwargs):
+            captured.update(kwargs)
+            output_item = SimpleNamespace(
+                type="image_generation_call",
+                status="generating",
+                id="ig_test",
+                result=_b64_png(),
+            )
+            done_event = SimpleNamespace(type="response.output_item.done", item=output_item)
+            final_response = SimpleNamespace(output=[], status="completed", output_text="")
+            return _FakeStream([done_event], final_response)
+
+        fake_client = SimpleNamespace(responses=SimpleNamespace(stream=_stream))
+        monkeypatch.setattr(codex_plugin, "_build_codex_client", lambda: fake_client)
+
+        result = provider.generate("a cat", aspect_ratio="portrait", quality="high")
+
+        assert result["success"] is True
+        assert result["model"] == "gpt-image-2-high"
+        assert result["quality"] == "high"
+        assert captured["tools"][0]["quality"] == "high"
+
+    def test_generate_accepts_per_call_model_tier(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        captured = {}
+
+        def _stream(**kwargs):
+            captured.update(kwargs)
+            output_item = SimpleNamespace(
+                type="image_generation_call",
+                status="generating",
+                id="ig_test",
+                result=_b64_png(),
+            )
+            done_event = SimpleNamespace(type="response.output_item.done", item=output_item)
+            final_response = SimpleNamespace(output=[], status="completed", output_text="")
+            return _FakeStream([done_event], final_response)
+
+        fake_client = SimpleNamespace(responses=SimpleNamespace(stream=_stream))
+        monkeypatch.setattr(codex_plugin, "_build_codex_client", lambda: fake_client)
+
+        result = provider.generate("a cat", aspect_ratio="portrait", model="gpt-image-2-low")
+
+        assert result["success"] is True
+        assert result["model"] == "gpt-image-2-low"
+        assert result["quality"] == "low"
+        assert captured["tools"][0]["quality"] == "low"
+
+    def test_generate_rejects_invalid_per_call_quality(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        result = provider.generate("a cat", quality="ultra")
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+        assert "quality" in result["error"]
+
     def test_codex_stream_request_includes_input_image_data_url(self, provider, monkeypatch, tmp_path):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
         reference = tmp_path / "reference.png"

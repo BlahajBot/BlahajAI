@@ -363,11 +363,12 @@ class TestAspectRatioNormalization:
 
 class TestRegistryIntegration:
 
-    def test_schema_exposes_prompt_aspect_ratio_and_optional_input_image(self, image_tool):
-        """The agent-facing schema stays tight: no model selection args, only
-        prompt, aspect ratio, and the optional reference image input."""
+    def test_schema_exposes_prompt_aspect_ratio_quality_and_optional_input_image(self, image_tool):
+        """The agent-facing schema stays semantic: prompt/aspect, optional
+        per-call quality tier, and optional reference image input."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
-        assert set(props.keys()) == {"prompt", "aspect_ratio", "input_image"}
+        assert set(props.keys()) == {"prompt", "aspect_ratio", "quality", "input_image"}
+        assert props["quality"]["enum"] == ["low", "medium", "high"]
 
     def test_schema_wording_guides_image_editing_use(self, image_tool):
         schema = image_tool.IMAGE_GENERATE_SCHEMA

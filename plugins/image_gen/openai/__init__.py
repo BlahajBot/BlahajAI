@@ -92,8 +92,39 @@ def _load_openai_config() -> Dict[str, Any]:
         return {}
 
 
-def _resolve_model() -> Tuple[str, Dict[str, Any]]:
-    """Decide which tier to use and return ``(model_id, meta)``."""
+def _model_id_for_quality(quality: str) -> Optional[str]:
+    """Return the virtual GPT Image 2 tier for a quality name."""
+    for model_id, meta in _MODELS.items():
+        if meta.get("quality") == quality:
+            return model_id
+    return None
+
+
+def _resolve_model(
+    requested_model: Optional[str] = None,
+    requested_quality: Optional[str] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Decide which tier to use and return ``(model_id, meta)``.
+
+    Per-call model/quality kwargs win over env/config so callers can choose
+    draft vs final render quality dynamically without mutating global config.
+    """
+    if isinstance(requested_model, str) and requested_model.strip():
+        candidate = requested_model.strip()
+        if candidate not in _MODELS:
+            raise ValueError(
+                f"Unsupported model '{candidate}'. Expected one of: "
+                f"{', '.join(_MODELS)}"
+            )
+        return candidate, _MODELS[candidate]
+
+    if isinstance(requested_quality, str) and requested_quality.strip():
+        quality = requested_quality.strip().lower()
+        candidate = _model_id_for_quality(quality)
+        if candidate is None:
+            raise ValueError("quality must be one of: low, medium, high")
+        return candidate, _MODELS[candidate]
+
     env_override = os.environ.get("OPENAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
         return env_override, _MODELS[env_override]
@@ -209,7 +240,19 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        tier_id, meta = _resolve_model()
+        try:
+            tier_id, meta = _resolve_model(
+                requested_model=kwargs.get("model"),
+                requested_quality=kwargs.get("quality"),
+            )
+        except ValueError as exc:
+            return error_response(
+                error=str(exc),
+                error_type="invalid_argument",
+                provider="openai",
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
         size = _SIZES.get(aspect, _SIZES["square"])
 
         # gpt-image-2 returns b64_json unconditionally and REJECTS
