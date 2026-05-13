@@ -128,7 +128,6 @@ async def test_registers_native_thread_slash_command(adapter):
 
     await command(interaction, name="Planning", message="", auto_archive_duration=1440)
 
-    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     adapter._handle_thread_create_slash.assert_awaited_once_with(interaction, "Planning", "", 1440)
 
 
@@ -215,6 +214,7 @@ async def test_handle_thread_create_slash_reports_success(adapter):
         channel_id=123,
         user=SimpleNamespace(display_name="Jezza", id=42),
         guild=SimpleNamespace(name="TestGuild"),
+        response=SimpleNamespace(defer=AsyncMock()),
         followup=SimpleNamespace(send=AsyncMock()),
     )
 
@@ -243,6 +243,7 @@ async def test_handle_thread_create_slash_dispatches_session_when_message_provid
         channel_id=123,
         user=SimpleNamespace(display_name="Jezza", id=42),
         guild=SimpleNamespace(name="TestGuild"),
+        response=SimpleNamespace(defer=AsyncMock()),
         followup=SimpleNamespace(send=AsyncMock()),
     )
 
@@ -265,6 +266,7 @@ async def test_handle_thread_create_slash_no_dispatch_without_message(adapter):
         channel_id=123,
         user=SimpleNamespace(display_name="Jezza", id=42),
         guild=SimpleNamespace(name="TestGuild"),
+        response=SimpleNamespace(defer=AsyncMock()),
         followup=SimpleNamespace(send=AsyncMock()),
     )
 
@@ -288,6 +290,7 @@ async def test_handle_thread_create_slash_falls_back_to_seed_message(adapter):
         channel_id=123,
         user=SimpleNamespace(display_name="Jezza", id=42),
         guild=SimpleNamespace(name="TestGuild"),
+        response=SimpleNamespace(defer=AsyncMock()),
         followup=SimpleNamespace(send=AsyncMock()),
     )
 
@@ -312,6 +315,7 @@ async def test_handle_thread_create_slash_reports_failure(adapter):
         channel=channel,
         channel_id=123,
         user=SimpleNamespace(display_name="Jezza", id=42),
+        response=SimpleNamespace(defer=AsyncMock()),
         followup=SimpleNamespace(send=AsyncMock()),
     )
 
