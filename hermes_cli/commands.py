@@ -141,6 +141,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status]",
                subcommands=("normal", "fast", "status", "on", "off")),
+    CommandDef("spark", "Run one prompt on gpt-5.3-codex-spark, then return to the session model", "Configuration",
+               args_hint="<prompt>"),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",

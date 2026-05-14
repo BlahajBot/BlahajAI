@@ -1862,13 +1862,12 @@ class GatewayRunner:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict, *, spark_lane: bool = False) -> dict:
         """Build the effective model/runtime config for a single turn.
 
-        Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        Normally uses the session's primary model/provider.  `/spark` is a
+        one-shot model override that does not mutate session model overrides
+        and does not inherit `/fast` service-tier overrides.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -1881,11 +1880,26 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
+        effective_model = model
+        if spark_lane:
+            effective_model = "gpt-5.3-codex-spark"
+            if runtime.get("provider") != "openai-codex":
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                spark_runtime = resolve_runtime_provider(requested="openai-codex")
+                runtime = {
+                    "api_key": spark_runtime.get("api_key"),
+                    "base_url": spark_runtime.get("base_url"),
+                    "provider": spark_runtime.get("provider", "openai-codex"),
+                    "api_mode": spark_runtime.get("api_mode"),
+                    "command": spark_runtime.get("command"),
+                    "args": list(spark_runtime.get("args") or []),
+                    "credential_pool": spark_runtime.get("credential_pool"),
+                }
         route = {
-            "model": model,
+            "model": effective_model,
             "runtime": runtime,
             "signature": (
-                model,
+                effective_model,
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
@@ -1893,6 +1907,11 @@ class GatewayRunner:
                 tuple(runtime["args"]),
             ),
         }
+
+        if spark_lane:
+            route["request_overrides"] = {}
+            route["spark_lane"] = True
+            return route
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -6056,6 +6075,22 @@ class GatewayRunner:
                 # doesn't think an agent is still active.
                 return await self._handle_reset_command(event)
 
+            # /spark <prompt> is a turn-boundary model switch; never steer or
+            # interrupt it into the active run. Queue the payload event with the
+            # spark marker so the follow-up path can route it after this turn.
+            if _cmd_def_inner and _cmd_def_inner.name == "spark":
+                spark_payload = event.get_command_args().strip()
+                if not spark_payload:
+                    return "Usage: /spark <prompt> — runs one prompt on gpt-5.3-codex-spark, with no prior transcript context."
+                if getattr(event, "media_urls", None):
+                    return "Spark lane is text-only; resend without /spark for image/vision work."
+                event.text = spark_payload
+                setattr(event, "spark_lane", True)
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    self._enqueue_fifo(_quick_key, event, adapter)
+                return "⚡ Spark queued for the next turn."
+
             # /queue <prompt> — queue without interrupting.
             # Semantics: each /queue invocation produces its own full agent
             # turn, processed in FIFO order after the current run (and any
@@ -6450,6 +6485,17 @@ class GatewayRunner:
 
         if canonical == "fast":
             return await self._handle_fast_command(event)
+
+        if canonical == "spark":
+            spark_payload = event.get_command_args().strip()
+            if not spark_payload:
+                return "Usage: /spark <prompt> — runs one prompt on gpt-5.3-codex-spark, with no prior transcript context."
+            if getattr(event, "media_urls", None):
+                return "Spark lane is text-only; resend without /spark for image/vision work."
+            event.text = spark_payload
+            setattr(event, "spark_lane", True)
+            command = None
+            canonical = None
 
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
@@ -7581,17 +7627,21 @@ class GatewayRunner:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
-            # Run the agent
+            # Run the agent. Spark is intentionally prompt-only: no transcript
+            # or platform context is sent to the Spark model, but its output is
+            # persisted below into the normal session transcript.
+            spark_lane = bool(getattr(event, "spark_lane", False))
             agent_result = await self._run_agent(
                 message=message_text,
-                context_prompt=context_prompt,
+                context_prompt="" if spark_lane else context_prompt,
                 history=history,
                 source=source,
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
+                channel_prompt=None if spark_lane else event.channel_prompt,
+                spark_lane=spark_lane,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -7880,7 +7930,7 @@ class GatewayRunner:
                     # _flush_messages_to_session_db(), so skip the DB write here
                     # to prevent the duplicate-write bug (#860).  We still write
                     # to JSONL for backward compatibility and as a backup.
-                    agent_persisted = self._session_db is not None
+                    agent_persisted = self._session_db is not None and not spark_lane
                     for msg in new_messages:
                         # Skip system messages (they're rebuilt each run)
                         if msg.get("role") == "system":
@@ -14190,6 +14240,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        spark_lane: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14894,7 +14945,12 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                model,
+                runtime_kwargs,
+                spark_lane=spark_lane,
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -14909,7 +14965,7 @@ class GatewayRunner:
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             _cache = getattr(self, "_agent_cache", None)
-            if _cache_lock and _cache is not None:
+            if not spark_lane and _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached = _cache.get(session_key)
                     if cached and cached[1] == _sig:
@@ -14954,14 +15010,17 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
-                    session_db=self._session_db,
+                    session_db=None if spark_lane else self._session_db,
                     fallback_model=self._fallback_model,
                 )
-                if _cache_lock and _cache is not None:
+                if not spark_lane and _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
+
+            if spark_lane:
+                agent._save_session_log = lambda *args, **kwargs: None
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
@@ -15149,7 +15208,8 @@ class GatewayRunner:
                         # whitelist and rationale.
                         entry = _build_replay_entry(role, content, msg)
                         agent_history.append(entry)
-            
+            api_history = [] if spark_lane else agent_history
+
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
@@ -15282,13 +15342,14 @@ class GatewayRunner:
                 except Exception:
                     _resume_entry = None
             _is_resume_pending = bool(
-                _resume_entry is not None
+                not spark_lane
+                and _resume_entry is not None
                 and getattr(_resume_entry, "resume_pending", False)
                 and _interruption_is_fresh
             )
             _has_fresh_tool_tail = bool(
-                agent_history
-                and agent_history[-1].get("role") == "tool"
+                api_history
+                and api_history[-1].get("role") == "tool"
                 and _interruption_is_fresh
             )
 
@@ -15365,7 +15426,9 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-                result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                result = agent.run_conversation(_run_message, conversation_history=api_history, task_id=session_id)
+                if spark_lane:
+                    result["messages"] = list(agent_history) + list(result.get("messages", []) or [])
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -16049,8 +16112,10 @@ class GatewayRunner:
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_spark_lane = False
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    next_spark_lane = bool(getattr(pending_event, "spark_lane", False))
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -16082,7 +16147,7 @@ class GatewayRunner:
 
                 return await self._run_agent(
                     message=next_message,
-                    context_prompt=context_prompt,
+                    context_prompt="" if next_spark_lane else context_prompt,
                     history=updated_history,
                     source=next_source,
                     session_id=session_id,
@@ -16090,7 +16155,8 @@ class GatewayRunner:
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
+                    channel_prompt=None if next_spark_lane else next_channel_prompt,
+                    spark_lane=next_spark_lane,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task

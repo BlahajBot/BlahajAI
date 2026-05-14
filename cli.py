@@ -98,6 +98,58 @@ from agent.markdown_tables import (
 from hermes_cli.banner import _format_context_length, format_banner_version_label
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_SPARK_MODEL = "gpt-5.3-codex-spark"
+_SPARK_PROVIDER = "openai-codex"
+_USE_DEFAULT_SESSION_DB = object()
+
+
+def _history_for_spark_turn(_history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Spark turns intentionally do not receive prior transcript context."""
+    return []
+
+
+def _merge_spark_turn_history(
+    prior_history: list[dict[str, Any]],
+    spark_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep Spark's prompt/answer visible to the main lane afterwards."""
+    return list(prior_history) + list(spark_messages or [])
+
+
+def _persist_spark_messages_to_session_db(session_db: Any, session_id: str, spark_messages: list[dict[str, Any]]) -> None:
+    """Append Spark's prompt/answer without letting its prompt-only run rewrite session metadata."""
+    if not session_db or not session_id or not spark_messages:
+        return
+    try:
+        if not session_db.get_session(session_id):
+            session_db.create_session(session_id=session_id, source="cli")
+    except Exception:
+        pass
+    for msg in spark_messages:
+        role = msg.get("role")
+        if role == "system" or not role:
+            continue
+        try:
+            session_db.append_message(
+                session_id=session_id,
+                role=role,
+                content=msg.get("content"),
+                tool_name=msg.get("tool_name"),
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id"),
+                finish_reason=msg.get("finish_reason"),
+                reasoning=msg.get("reasoning") if role == "assistant" else None,
+                reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
+                reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
+                codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+            )
+        except Exception:
+            pass
+
+
+def _spark_usage_text() -> str:
+    return "Usage: /spark <prompt> — runs one prompt on gpt-5.3-codex-spark, with no prior transcript context."
 
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
@@ -4029,13 +4081,12 @@ class HermesCLI:
 
         return True
 
-    def _resolve_turn_agent_config(self, user_message: str) -> dict:
+    def _resolve_turn_agent_config(self, user_message: str, *, spark_lane: bool = False) -> dict:
         """Build the effective model/runtime config for a single user turn.
 
-        Always uses the session's primary model/provider.  If the user has
-        toggled `/fast` on and the current model supports Priority
-        Processing / Anthropic fast mode, attach `request_overrides` so the
-        API call is marked accordingly.
+        Normally uses the session's primary model/provider.  `/spark` is a
+        one-shot model override: it does not mutate the session default and
+        never inherits `/fast` service-tier overrides.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -4048,11 +4099,28 @@ class HermesCLI:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+
+        model = self.model
+        if spark_lane:
+            model = _SPARK_MODEL
+            if runtime.get("provider") != _SPARK_PROVIDER:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                spark_runtime = resolve_runtime_provider(requested=_SPARK_PROVIDER)
+                runtime = {
+                    "api_key": spark_runtime.get("api_key"),
+                    "base_url": spark_runtime.get("base_url"),
+                    "provider": spark_runtime.get("provider", _SPARK_PROVIDER),
+                    "api_mode": spark_runtime.get("api_mode"),
+                    "command": spark_runtime.get("command"),
+                    "args": list(spark_runtime.get("args") or []),
+                    "credential_pool": spark_runtime.get("credential_pool"),
+                }
+
         route = {
-            "model": self.model,
+            "model": model,
             "runtime": runtime,
             "signature": (
-                self.model,
+                model,
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
@@ -4060,6 +4128,11 @@ class HermesCLI:
                 tuple(runtime["args"]),
             ),
         }
+
+        if spark_lane:
+            route["request_overrides"] = None
+            route["spark_lane"] = True
+            return route
 
         service_tier = getattr(self, "service_tier", None)
         if not service_tier:
@@ -4073,7 +4146,14 @@ class HermesCLI:
         route["request_overrides"] = overrides
         return route
 
-    def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:
+    def _init_agent(
+        self,
+        *,
+        model_override: str = None,
+        runtime_override: dict = None,
+        request_overrides: dict | None = None,
+        session_db_override: Any = _USE_DEFAULT_SESSION_DB,
+    ) -> bool:
         """
         Initialize the agent on first use.
         When resuming a session, restores conversation history from SQLite.
@@ -4189,7 +4269,11 @@ class HermesCLI:
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id,
                 platform="cli",
-                session_db=self._session_db,
+                session_db=(
+                    self._session_db
+                    if session_db_override is _USE_DEFAULT_SESSION_DB
+                    else session_db_override
+                ),
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
 
@@ -7518,6 +7602,14 @@ class HermesCLI:
             self._handle_reasoning_command(cmd_original)
         elif canonical == "fast":
             self._handle_fast_command(cmd_original)
+        elif canonical == "spark":
+            parts = cmd_original.split(None, 1)
+            payload = parts[1].strip() if len(parts) > 1 else ""
+            if not payload:
+                _cprint(f"  {_spark_usage_text()}")
+            elif hasattr(self, '_pending_input'):
+                self._pending_input.put(("__spark__", payload))
+                _cprint(f"  ⚡ Spark queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "compress":
             self._manual_compress(cmd_original)
         elif canonical == "usage":
@@ -10231,7 +10323,7 @@ class HermesCLI:
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None) -> Optional[str]:
+    def chat(self, message, images: list = None, spark_lane: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -10264,8 +10356,23 @@ class HermesCLI:
         if not self._ensure_runtime_credentials():
             return None
 
-        turn_route = self._resolve_turn_agent_config(message)
-        if turn_route["signature"] != self._active_agent_route_signature:
+        if spark_lane and images:
+            _cprint("  Spark lane is text-only; resend without /spark for image/vision work.")
+            return None
+
+        turn_route = self._resolve_turn_agent_config(message, spark_lane=spark_lane)
+        spark_saved_agent = None
+        spark_saved_route_signature = None
+        if spark_lane:
+            # /spark must always run on an isolated scratch agent.  If the
+            # session's normal model is already gpt-5.3-codex-spark, the route
+            # signature would otherwise match and we could accidentally
+            # monkeypatch/reuse the normal lane's agent.
+            spark_saved_agent = self.agent
+            spark_saved_route_signature = self._active_agent_route_signature
+            self.agent = None
+            self._active_agent_route_signature = None
+        elif turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
         # Initialize agent if needed
@@ -10275,8 +10382,14 @@ class HermesCLI:
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
+            session_db_override=None if spark_lane else _USE_DEFAULT_SESSION_DB,
         ):
+            if spark_lane:
+                self.agent = spark_saved_agent
+                self._active_agent_route_signature = spark_saved_route_signature
             return None
+        if spark_lane and self.agent is not None:
+            self.agent._save_session_log = lambda *args, **kwargs: None
         
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -10366,6 +10479,7 @@ class HermesCLI:
             message = _sanitize_surrogates(message)
 
         # Add user message to history
+        history_before_turn = list(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": message})
 
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
@@ -10478,10 +10592,15 @@ class HermesCLI:
                 if _srn:
                     agent_message = _srn + "\n\n" + agent_message
                     self._pending_skills_reload_note = None
+                agent_history = (
+                    _history_for_spark_turn(self.conversation_history[:-1])
+                    if spark_lane
+                    else self.conversation_history[:-1]
+                )
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                        conversation_history=agent_history,  # Exclude the message we just added
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=message if _voice_prefix else None,
@@ -10622,8 +10741,21 @@ class HermesCLI:
             sys.stdout.flush()
             time.sleep(0.15)
 
-            # Update history with full conversation
-            self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+            # Update history with full conversation.  Spark deliberately ran
+            # prompt-only, but its prompt/answer become durable main context.
+            if spark_lane and result:
+                spark_messages = result.get("messages", [])
+                self.conversation_history = _merge_spark_turn_history(
+                    history_before_turn,
+                    spark_messages,
+                )
+                _persist_spark_messages_to_session_db(
+                    self._session_db,
+                    self.session_id,
+                    spark_messages,
+                )
+            else:
+                self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -10830,6 +10962,14 @@ class HermesCLI:
                 stop_event.set()
             if tts_thread is not None and tts_thread.is_alive():
                 tts_thread.join(timeout=5)
+            if spark_lane:
+                self.agent = spark_saved_agent
+                self._active_agent_route_signature = spark_saved_route_signature
+                try:
+                    global _active_agent_ref
+                    _active_agent_ref = self.agent
+                except Exception:
+                    pass
     
     def _print_exit_summary(self):
         """Print session resume info on exit, similar to Claude Code."""
@@ -12956,10 +13096,17 @@ class HermesCLI:
                     if not user_input:
                         continue
 
-                    # Unpack image payload: (text, [Path, ...]) or plain str
+                    # Unpack image payload: (text, [Path, ...]) or plain str.
+                    # /spark uses a small internal tuple so it can pass through
+                    # the same FIFO without turning into a normal slash command.
                     submit_images = []
+                    spark_lane = False
                     if isinstance(user_input, tuple):
-                        user_input, submit_images = user_input
+                        if len(user_input) == 2 and user_input[0] == "__spark__":
+                            spark_lane = True
+                            user_input = user_input[1]
+                        else:
+                            user_input, submit_images = user_input
 
                     if isinstance(user_input, str):
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
@@ -12985,13 +13132,26 @@ class HermesCLI:
                             )
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
-                        _cprint(f"\n⚙️  {user_input}")
-                        if not self.process_command(user_input):
-                            self._should_exit = True
-                            # Schedule app exit
-                            if app.is_running:
-                                app.exit()
-                        continue
+                        _cmd_word = user_input.strip().split(None, 1)[0].lstrip("/").split("@", 1)[0].lower()
+                        if _cmd_word == "spark":
+                            if submit_images:
+                                _cprint("  Spark lane is text-only; resend without /spark for image/vision work.")
+                                continue
+                            _spark_parts = user_input.split(None, 1)
+                            _spark_payload = _spark_parts[1].strip() if len(_spark_parts) > 1 else ""
+                            if not _spark_payload:
+                                _cprint(f"  {_spark_usage_text()}")
+                                continue
+                            user_input = _spark_payload
+                            spark_lane = True
+                        else:
+                            _cprint(f"\n⚙️  {user_input}")
+                            if not self.process_command(user_input):
+                                self._should_exit = True
+                                # Schedule app exit
+                                if app.is_running:
+                                    app.exit()
+                            continue
                     
                     # Expand paste references back to full content
                     _paste_ref_re = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
@@ -13011,7 +13171,7 @@ class HermesCLI:
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        self.chat(user_input, images=submit_images or None, spark_lane=spark_lane)
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
