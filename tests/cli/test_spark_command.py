@@ -28,6 +28,14 @@ def test_spark_command_registered():
     assert "gpt-5.3-codex-spark" in cmd.description
 
 
+def test_spark_command_appears_in_telegram_menu():
+    from hermes_cli.commands import telegram_bot_commands, telegram_menu_commands
+
+    assert ("spark", "Run one prompt on gpt-5.3-codex-spark, then return to the session model") in telegram_bot_commands()
+    menu_commands, _hidden = telegram_menu_commands()
+    assert any(name == "spark" for name, _description in menu_commands)
+
+
 def test_cli_spark_turn_route_is_one_shot_model_override():
     cli_mod = _import_cli()
     stub = SimpleNamespace(

@@ -199,6 +199,20 @@ async def test_auto_registered_command_with_args(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_does_not_register_native_spark_slash_command(adapter):
+    """Keep /spark as text on Discord so its prompt remains visible.
+
+    Discord native slash commands hide option text from channel history.  For
+    /spark the option text *is* the user prompt, so registering it natively
+    makes the prompt look swallowed even though the gateway receives it.
+    """
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "spark" not in adapter._client.tree.commands
+
+
 # ------------------------------------------------------------------
 # _handle_thread_create_slash — success, session dispatch, failure
 # ------------------------------------------------------------------
