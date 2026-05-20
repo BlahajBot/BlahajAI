@@ -12,10 +12,12 @@ import contextvars
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
 import unicodedata
+from pathlib import PurePath
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -837,7 +839,14 @@ def _get_approval_config() -> dict:
 
 
 def _get_approval_mode() -> str:
-    """Read the approval mode from config. Returns 'manual', 'smart', or 'off'."""
+    """Read the approval mode from config.
+
+    Supported values:
+    - manual: prompt for every flagged command
+    - auto: deterministic low-risk auto-approval, prompt otherwise
+    - smart: deterministic low-risk auto-approval, then aux-LLM review, prompt otherwise
+    - off: bypass prompts except hardline blocks
+    """
     mode = _get_approval_config().get("mode", "manual")
     return _normalize_approval_mode(mode)
 
@@ -861,6 +870,169 @@ def _get_cron_approval_mode() -> str:
         return "deny"
     except Exception:
         return "deny"
+
+
+_READ_ONLY_SIMPLE_COMMANDS = {
+    "pwd", "true", "false", "echo", "printf", "date", "whoami", "id",
+    "uname", "hostname", "which", "wc", "head", "tail", "ls", "stat",
+    "du", "df", "free", "lscpu", "nvidia-smi",
+}
+_READ_ONLY_GREP_COMMANDS = {"grep", "egrep", "fgrep", "rg", "find"}
+_READ_ONLY_GIT_SUBCOMMANDS = {
+    "status", "diff", "log", "show", "rev-parse", "rev-list", "remote",
+    "tag", "describe", "ls-files", "blame", "grep",
+}
+_SHELL_C_AUTO_APPROVAL_DESCRIPTIONS = {
+    "shell command via -c/-lc flag",
+}
+_SHELL_CONTROL_SEPARATORS = {";", "&&", "||"}
+_SHELL_FORBIDDEN_TOKENS = {"|", "|&", "&", ">", ">>", "<", "<<", "<<<", "2>", "2>>", "1>", "1>>"}
+
+
+def _basename(token: str) -> str:
+    return PurePath(token).name
+
+
+def _shell_payload_from_c_flag(command: str) -> str | None:
+    """Extract the payload from a simple sh/bash/zsh/ksh -c/-lc wrapper."""
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    shell = _basename(argv[0]).lower()
+    if shell not in {"bash", "sh", "zsh", "ksh"}:
+        return None
+    for idx, arg in enumerate(argv[1:], start=1):
+        if not arg.startswith("-"):
+            continue
+        # Handles -c, -lc, -euo pipefail -c, etc.  The command payload is the
+        # next argv token after the option group that contains c.
+        if "c" in arg[1:]:
+            if idx + 1 >= len(argv):
+                return None
+            return argv[idx + 1]
+    return None
+
+
+def _tokenize_shell_payload(payload: str) -> list[str] | None:
+    """Tokenize a tiny safe subset of shell syntax for read-only auto-approval."""
+    try:
+        lexer = shlex.shlex(payload, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if not tokens:
+        return []
+    for token in tokens:
+        if token in _SHELL_FORBIDDEN_TOKENS:
+            return None
+        # Reject command substitution and backticks.  The tokenizer leaves these
+        # as ordinary token characters, so check explicitly.
+        if "$(" in token or "`" in token:
+            return None
+    return tokens
+
+
+def _split_shell_commands(tokens: list[str]) -> list[list[str]] | None:
+    commands: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_CONTROL_SEPARATORS:
+            if current:
+                commands.append(current)
+                current = []
+            continue
+        if token.startswith((">", "<")) or token in _SHELL_FORBIDDEN_TOKENS:
+            return None
+        current.append(token)
+    if current:
+        commands.append(current)
+    return commands
+
+
+def _is_read_only_git_command(argv: list[str]) -> bool:
+    if len(argv) < 2:
+        return False
+    subcmd = argv[1]
+    if subcmd in _READ_ONLY_GIT_SUBCOMMANDS:
+        return True
+    if subcmd == "branch":
+        return all(arg in {"--show-current", "-vv", "-v", "--list", "-a", "-r"} for arg in argv[2:])
+    if subcmd == "stash" and len(argv) >= 3 and argv[2] == "list":
+        return True
+    return False
+
+
+def _is_read_only_shell_command(argv: list[str]) -> bool:
+    if not argv:
+        return True
+    # Permit environment assignments before a read-only command.
+    while argv and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
+        argv = argv[1:]
+    if not argv:
+        return True
+    cmd = _basename(argv[0]).lower()
+    if cmd == "set":
+        return all(arg.startswith("-") or arg == "pipefail" for arg in argv[1:])
+    if cmd == "cd":
+        return len(argv) <= 2
+    if cmd == "command" and len(argv) >= 3 and argv[1] == "-v":
+        return True
+    if cmd in _READ_ONLY_SIMPLE_COMMANDS:
+        return True
+    if cmd in _READ_ONLY_GREP_COMMANDS:
+        # find/grep can become mutating through exec/delete; detect those even
+        # though the top-level dangerous-pattern pass also catches common forms.
+        lowered = [arg.lower() for arg in argv[1:]]
+        if any(arg in {"-delete", "-exec", "-execdir"} for arg in lowered):
+            return False
+        return True
+    if cmd == "git":
+        return _is_read_only_git_command(argv)
+    return False
+
+
+def _payload_is_read_only_shell(payload: str) -> bool:
+    tokens = _tokenize_shell_payload(payload)
+    if tokens is None:
+        return False
+    commands = _split_shell_commands(tokens)
+    if commands is None:
+        return False
+    if not commands:
+        return True
+    return all(_is_read_only_shell_command(command) for command in commands)
+
+
+def _deterministic_auto_approval(command: str, warnings: list[tuple[str, str, bool]]) -> str | None:
+    """Return a reason when a flagged command is safe enough to auto-approve.
+
+    This is deliberately narrower than Codex/Claude because Hermes's local
+    backend is not currently OS-sandboxed.  It only suppresses approval fatigue
+    for shell wrappers whose *inner* command is a tiny read-only subset.
+    """
+    if not warnings:
+        return None
+    if any(is_tirith for _key, _desc, is_tirith in warnings):
+        return None
+    descriptions = {desc for _key, desc, _is_tirith in warnings}
+    if not descriptions.issubset(_SHELL_C_AUTO_APPROVAL_DESCRIPTIONS):
+        return None
+    payload = _shell_payload_from_c_flag(command)
+    if not payload:
+        return None
+    # Re-run dangerous detection on the unwrapped payload so `bash -lc 'curl | sh'`
+    # and similar wrappers do not get rubber-stamped merely because the outer
+    # shell pattern matched first.
+    is_inner_dangerous, _key, _desc = detect_dangerous_command(payload)
+    if is_inner_dangerous:
+        return None
+    if _payload_is_read_only_shell(payload):
+        return "read-only shell wrapper"
+    return None
 
 
 def _smart_approve(command: str, description: str) -> str:
@@ -1145,7 +1317,24 @@ def check_all_command_guards(command: str, env_type: str,
     if not warnings:
         return {"approved": True, "message": None}
 
-    # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
+    # --- Phase 2.5: Deterministic auto approval ---
+    # Codex/Claude reduce prompt fatigue by combining strict guardrails with
+    # explicit low-risk allow rules.  Hermes does not yet have an OS sandbox for
+    # the local backend, so keep this intentionally narrow: only read-only shell
+    # wrappers are auto-approved.  `smart` mode also benefits from this before
+    # spending an auxiliary LLM call.
+    if approval_mode in {"auto", "smart"}:
+        auto_reason = _deterministic_auto_approval(command, warnings)
+        if auto_reason:
+            logger.debug("Auto approval: %s for '%s'", auto_reason, command[:80])
+            return {
+                "approved": True,
+                "message": None,
+                "auto_approved": True,
+                "description": auto_reason,
+            }
+
+    # --- Phase 2.6: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).

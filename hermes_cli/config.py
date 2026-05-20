@@ -1417,7 +1417,8 @@ DEFAULT_CONFIG = {
 
     # Approval mode for dangerous commands:
     #   manual — always prompt the user (default)
-    #   smart  — use auxiliary LLM to auto-approve low-risk commands, prompt for high-risk
+    #   auto   — deterministically auto-approve narrowly scoped low-risk commands, prompt otherwise
+    #   smart  — auto mode first, then auxiliary LLM risk review, prompt if uncertain
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
     # cron_mode — what to do when a cron job hits a dangerous command:

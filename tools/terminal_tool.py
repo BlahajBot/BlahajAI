@@ -1893,6 +1893,9 @@ def terminal_tool(
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+            elif approval.get("auto_approved"):
+                desc = approval.get("description", "flagged as dangerous")
+                approval_note = f"Command was flagged and auto-approved by deterministic approval ({desc})."
 
         # Validate workdir against shell injection
         if workdir:
