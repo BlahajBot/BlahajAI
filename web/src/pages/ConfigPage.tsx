@@ -118,6 +118,7 @@ export default function ConfigPage() {
   const [yamlText, setYamlText] = useState("");
   const [yamlLoading, setYamlLoading] = useState(false);
   const [yamlSaving, setYamlSaving] = useState(false);
+  const [configPath, setConfigPath] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>("");
   const [confirmReset, setConfirmReset] = useState(false);
   const { toast, showToast } = useToast();
@@ -176,6 +177,10 @@ export default function ConfigPage() {
     api
       .getDefaults()
       .then(setDefaults)
+      .catch(() => {});
+    api
+      .getStatus()
+      .then((resp) => setConfigPath(resp.config_path))
       .catch(() => {});
   }, []);
 
@@ -412,14 +417,14 @@ export default function ConfigPage() {
       <PluginSlot name="config:top" />
       <Toast toast={toast} />
 
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2">
-          <Settings2 className="h-4 w-4 text-muted-foreground" />
-          <code className="text-xs text-muted-foreground bg-muted/50 px-2 py-0.5">
-            {t.config.configPath}
+      <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+        <div className="flex min-w-0 items-center gap-2 sm:flex-1">
+          <Settings2 className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <code className="min-w-0 flex-1 break-words text-xs text-muted-foreground bg-muted/50 px-2 py-0.5">
+            {configPath ?? t.config.configPath}
           </code>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5 sm:shrink-0">
           <Button
             ghost
             size="icon"

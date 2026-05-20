@@ -327,6 +327,55 @@ LINTERS = {
 }
 
 
+# Patterns that indicate the linter base command exists on PATH but
+# couldn't actually run — e.g. ``npx tsc`` when tsc isn't installed in
+# node_modules, or rustfmt complaining there's no Cargo project.  When
+# any of these substrings appears in the linter output, ``_check_lint``
+# returns ``skipped`` instead of ``error`` so:
+#
+# 1. The write isn't flagged for a tooling problem the agent can't fix.
+# 2. The LSP semantic tier still runs (it gates on success/skipped).
+#
+# Patterns are matched case-insensitively against linter stdout.
+_LINTER_UNUSABLE_PATTERNS = {
+    'npx': (
+        # npx prints this banner when the package isn't installed locally
+        # AND it can't auto-install (no internet, registry off, etc.) or
+        # when the binary it tried to run is the wrong one.
+        'this is not the tsc command you are looking for',
+        # npx with --no-install resolution failures
+        'could not determine executable to run',
+        'not found in npm registry',
+    ),
+    'rustfmt': (
+        # rustfmt outside a Cargo project
+        'no input filename given',
+        'error: not a workspace',
+    ),
+    'go': (
+        # ``go vet`` on a file outside a module / GOPATH
+        'cannot find package',
+        'go: cannot find main module',
+    ),
+}
+
+
+def _looks_like_linter_unusable(base_cmd: str, output: str) -> bool:
+    """Return True iff ``output`` from ``base_cmd`` indicates the linter
+    itself couldn't run (a tooling gap), as opposed to a real lint error
+    in the file being checked.
+
+    ``base_cmd`` is the first word of the linter command line (``npx``,
+    ``rustfmt``, ``go``, ...).  ``output`` is the stdout/stderr captured
+    from running it.
+    """
+    patterns = _LINTER_UNUSABLE_PATTERNS.get(base_cmd)
+    if not patterns:
+        return False
+    lower = output.lower()
+    return any(p in lower for p in patterns)
+
+
 def _lint_json_inproc(content: str) -> tuple[bool, str]:
     """In-process JSON syntax check.  Returns (ok, error_message)."""
     import json as _json
@@ -860,19 +909,29 @@ class ShellFileOperations(FileOperations):
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
-        # Capture pre-write content for lint-delta computation.  Only do this
-        # when an in-process OR shell linter exists for this extension — no
-        # point paying for the read otherwise.  For in-process linters we
-        # pass the content directly; for shell linters the pre-state isn't
-        # useful (we'd have to re-write-read to lint the old version, which
-        # defeats the purpose), so we skip the capture and accept the naive
-        # "all errors" report.
+        # Capture pre-write content.  Two consumers want it:
+        #
+        #   1. The lint-delta layer (for in-process linters like ast.parse
+        #      and json.loads) needs the previous content to compute the
+        #      set of NEW lint errors introduced by this write.
+        #   2. The LSP layer needs pre/post content to build a line-shift
+        #      map — pre-existing diagnostics below the edit point shift
+        #      when lines are added/removed, and the shift map remaps
+        #      baseline diagnostics into post-edit coordinates so the
+        #      strict (range-aware) delta key matches.
+        #
+        # The set of extensions we capture pre_content for is therefore
+        # the UNION of in-process lint coverage and LSP coverage.  For
+        # extensions outside both sets (binaries, opaque formats),
+        # skipping the read keeps the hot path fast.
         ext = os.path.splitext(path)[1].lower()
         pre_content: Optional[str] = None
-        if ext in LINTERS_INPROC:
+        want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
+        if want_pre:
             # Best-effort read; failure (file missing, permission) leaves
-            # pre_content as None which makes the delta step degrade
-            # gracefully to "report all errors".
+            # pre_content as None which makes both downstream consumers
+            # degrade gracefully (lint reports all errors; LSP skips the
+            # shift map).
             read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
             read_result = self._exec(read_cmd)
             if read_result.exit_code == 0 and read_result.stdout:
@@ -917,11 +976,15 @@ class ShellFileOperations(FileOperations):
 
         # Semantic diagnostics from the LSP layer — separate channel.
         # Only fired when the syntax tier reported clean (no point asking
-        # an LSP for a file that won't even parse).  Best-effort:
-        # ``""`` is returned for any failure path.
+        # an LSP for a file that won't even parse).  Pass pre/post
+        # content so the LSP layer can build a line-shift map and
+        # remap baseline diagnostics into post-edit coordinates.
+        # Best-effort: ``""`` is returned for any failure path.
         lsp_diagnostics: Optional[str] = None
         if lint_result.success or lint_result.skipped:
-            block = self._maybe_lsp_diagnostics(path)
+            block = self._maybe_lsp_diagnostics(
+                path, pre_content=pre_content, post_content=content
+            )
             if block:
                 lsp_diagnostics = block
 
@@ -1117,6 +1180,24 @@ class ShellFileOperations(FileOperations):
         cmd = linter_cmd.replace("{file}", self._escape_shell_arg(path))
         result = self._exec(cmd, timeout=30)
 
+        if result.exit_code != 0 and _looks_like_linter_unusable(base_cmd, result.stdout):
+            # The linter command exists on PATH but couldn't actually run
+            # (e.g. ``npx tsc`` when tsc isn't in node_modules; ``rustfmt
+            # --check`` without a Cargo project).  This is a tooling gap,
+            # not a real lint failure — surface it as ``skipped`` so the
+            # write doesn't get flagged AND so the LSP tier still runs.
+            from tools.ansi_strip import strip_ansi
+            cleaned = strip_ansi(result.stdout).strip()
+            # Collapse to a single line — the npx banner is multi-line ASCII.
+            first_line = next(
+                (ln.strip() for ln in cleaned.splitlines() if ln.strip()),
+                cleaned[:120],
+            )
+            return LintResult(
+                skipped=True,
+                message=f"{base_cmd} not usable: {first_line[:200]}",
+            )
+
         return LintResult(
             success=result.exit_code == 0,
             output=result.stdout.strip() if result.stdout.strip() else ""
@@ -1228,6 +1309,29 @@ class ShellFileOperations(FileOperations):
             return False
         return isinstance(env, LocalEnvironment)
 
+    def _lsp_handles_extension(self, ext: str) -> bool:
+        """Return True iff some registered LSP server claims this extension.
+
+        Used to decide whether to capture pre-write content for the
+        line-shift map.  Capturing is cheap (one ``cat`` on the host)
+        but pointless if no LSP would ever look at the file.
+
+        Safe to call on remote backends — the registry is purely
+        in-process metadata; we still gate the actual LSP path on
+        :meth:`_lsp_local_only`.
+        """
+        if not ext:
+            return False
+        try:
+            from agent.lsp.servers import SERVERS
+        except Exception:  # noqa: BLE001
+            return False
+        ext_lower = ext.lower()
+        for srv in SERVERS:
+            if ext_lower in srv.extensions:
+                return True
+        return False
+
     def _snapshot_lsp_baseline(self, path: str) -> None:
         """Capture pre-edit LSP diagnostics so the post-write delta is correct.
 
@@ -1251,11 +1355,24 @@ class ShellFileOperations(FileOperations):
         except Exception:  # noqa: BLE001
             pass
 
-    def _maybe_lsp_diagnostics(self, path: str) -> str:
+    def _maybe_lsp_diagnostics(
+        self,
+        path: str,
+        *,
+        pre_content: Optional[str] = None,
+        post_content: Optional[str] = None,
+    ) -> str:
         """Best-effort LSP semantic diagnostics for ``path``.
 
         Returns a formatted ``<diagnostics>`` block, or empty string
         when LSP is unavailable / disabled / produced no errors.
+
+        When both ``pre_content`` and ``post_content`` are provided,
+        a line-shift map is built and passed to the LSPService so
+        baseline diagnostics are remapped into post-edit coordinates
+        before the set-difference.  Without this, edits that delete
+        or insert lines surface every pre-existing diagnostic below
+        the edit point as "introduced by this edit".
 
         Wraps everything in a try/except so a misbehaving LSP server
         can't break a write.  This intentionally swallows all errors
@@ -1277,8 +1394,20 @@ class ShellFileOperations(FileOperations):
             return ""
         if svc is None or not svc.enabled_for(path):
             return ""
+
+        # Build a line-shift map when we have both pre and post — it
+        # remaps baseline diagnostics into post-edit coordinates so
+        # the strict (range-aware) delta key matches correctly.
+        line_shift = None
+        if pre_content is not None and post_content is not None and pre_content != post_content:
+            try:
+                from agent.lsp.range_shift import build_line_shift
+                line_shift = build_line_shift(pre_content, post_content)
+            except Exception:  # noqa: BLE001
+                line_shift = None
+
         try:
-            diagnostics = svc.get_diagnostics_sync(path, delta=True)
+            diagnostics = svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
         except Exception:  # noqa: BLE001
             return ""
         if not diagnostics:

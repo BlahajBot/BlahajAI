@@ -28,6 +28,45 @@ from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
+# Fast backoff for tests that exercise the retry loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_backoff_wait(monkeypatch):
+    """Short-circuit retry backoff so tests don't block on real wall-clock waits.
+
+    The production code uses jittered_backoff() with a 5s base delay plus a
+    tight time.sleep(0.2) loop. Without this patch, each 429/500/529 retry
+    test burns ~10s of real time on CI — across six tests that's ~60s for
+    behavior we're not asserting against timing.
+
+    Tests assert retry counts and final results, never wait durations.
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
+    # The conversation loop was extracted out of run_agent.py into
+    # agent.conversation_loop, which holds its own `from agent.retry_utils
+    # import jittered_backoff` reference. Patching `run_agent.jittered_backoff`
+    # alone leaves the live retry path using real ~2s waits. Patch both.
+    from agent import conversation_loop as _conv_loop
+    monkeypatch.setattr(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0)
+    monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
+
+    # Also fast-path asyncio.sleep — the gateway's _run_agent path has
+    # several await asyncio.sleep(...) calls that add real wall-clock time.
+    _real_asyncio_sleep = _asyncio.sleep
+
+    async def _fast_sleep(delay=0, *args, **kwargs):
+        # Yield to the event loop but skip the actual delay.
+        await _real_asyncio_sleep(0)
+
+    monkeypatch.setattr(_asyncio, "sleep", _fast_sleep)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -102,12 +141,24 @@ class _PromptTooLongError(Exception):
         self.status_code = 400
 
 
+class _FakeMessages:
+    """Stub for client.messages.create() / client.messages.stream()."""
+    def create(self, **kwargs):
+        raise NotImplementedError("_FakeAnthropicClient.messages.create should not be called directly in tests")
+
+    def stream(self, **kwargs):
+        raise NotImplementedError("_FakeAnthropicClient.messages.stream should not be called directly in tests")
+
+
 class _FakeAnthropicClient:
+    def __init__(self):
+        self.messages = _FakeMessages()
+
     def close(self):
         pass
 
 
-def _fake_build_anthropic_client(key, base_url=None):
+def _fake_build_anthropic_client(key, base_url=None, **kwargs):
     return _FakeAnthropicClient()
 
 
@@ -131,13 +182,14 @@ def _make_agent_cls(error_cls, recover_after=None):
         def run_conversation(self, user_message, conversation_history=None, task_id=None):
             calls = {"n": 0}
 
-            def _fake_api_call(api_kwargs):
+            def _fake_api_call(api_kwargs, **kw):
                 calls["n"] += 1
                 if recover_after is not None and calls["n"] > recover_after:
                     return _anthropic_response("Recovered")
                 raise error_cls()
 
             self._interruptible_api_call = _fake_api_call
+            self._interruptible_streaming_api_call = _fake_api_call
             return super().run_conversation(
                 user_message, conversation_history=conversation_history, task_id=task_id
             )
@@ -170,7 +222,6 @@ def _run_with_agent(monkeypatch, agent_cls):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
-    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
@@ -269,7 +320,7 @@ def test_build_api_kwargs_typeerror_does_not_crash_with_unboundlocal(monkeypatch
             "provider": "anthropic",
             "api_mode": "anthropic_messages",
             "base_url": "https://api.anthropic.com",
-            "api_key": "sk-ant-api03-test-key",
+            "api_key": "***",
         },
     )
 
@@ -279,7 +330,6 @@ def test_build_api_kwargs_typeerror_does_not_crash_with_unboundlocal(monkeypatch
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
-    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
@@ -378,7 +428,6 @@ def test_401_credential_refresh_recovers(monkeypatch):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
-    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
@@ -426,10 +475,11 @@ def test_401_refresh_fails_is_non_retryable(monkeypatch):
             return False  # Simulate failed credential refresh
 
         def run_conversation(self, user_message, conversation_history=None, task_id=None):
-            def _fake_api_call(api_kwargs):
+            def _fake_api_call(api_kwargs, **kw):
                 raise _UnauthorizedError()
 
             self._interruptible_api_call = _fake_api_call
+            self._interruptible_streaming_api_call = _fake_api_call
             return super().run_conversation(
                 user_message, conversation_history=conversation_history, task_id=task_id
             )
@@ -452,7 +502,6 @@ def test_401_refresh_fails_is_non_retryable(monkeypatch):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
-    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
@@ -511,13 +560,14 @@ def test_prompt_too_long_triggers_compression(monkeypatch):
         def run_conversation(self, user_message, conversation_history=None, task_id=None):
             calls = {"n": 0}
 
-            def _fake_api_call(api_kwargs):
+            def _fake_api_call(api_kwargs, **kw):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise _PromptTooLongError()
                 return _anthropic_response("Compressed and recovered")
 
             self._interruptible_api_call = _fake_api_call
+            self._interruptible_streaming_api_call = _fake_api_call
             return super().run_conversation(
                 user_message, conversation_history=conversation_history, task_id=task_id
             )
@@ -541,7 +591,6 @@ def test_prompt_too_long_triggers_compression(monkeypatch):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
-    runner._session_model_overrides = {}
     runner._fallback_model = None
     runner._running_agents = {}
     runner.hooks = MagicMock()
