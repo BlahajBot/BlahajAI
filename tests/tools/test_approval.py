@@ -15,6 +15,8 @@ from tools.approval import (
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
+    reset_current_session_key,
+    set_current_session_key,
     submit_pending,
 )
 
@@ -30,18 +32,57 @@ class TestApprovalModeParsing:
 
 
 class TestSmartApproval:
-    def test_smart_approval_uses_call_llm(self):
+    def test_smart_approval_uses_structured_json_decision_with_reason(self):
         response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="APPROVE"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"decision":"approve","reason":"The command only prints a fixed string. '
+                'It does not modify files, services, credentials, or network state."}'
+            )))]
         )
         with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
             result = _smart_approve("python -c \"print('hello')\"", "script execution via -c flag")
 
-        assert result == "approve"
+        assert result["decision"] == "approve"
+        assert "prints a fixed string" in result["reason"]
         mock_call.assert_called_once()
         assert mock_call.call_args.kwargs["task"] == "approval"
         assert mock_call.call_args.kwargs["temperature"] == 0
-        assert mock_call.call_args.kwargs["max_tokens"] == 16
+        assert mock_call.call_args.kwargs["max_tokens"] == 128
+
+    def test_smart_approval_rejects_loose_substring_approve_text(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="DO NOT APPROVE"))]
+        )
+        with mock_patch("agent.auxiliary_client.call_llm", return_value=response):
+            result = _smart_approve("rm -rf /tmp/stuff", "recursive delete")
+
+        assert result["decision"] == "escalate"
+        assert "structured JSON" in result["reason"]
+
+    def test_smart_mode_includes_rationale_in_auto_approval_result(self):
+        command = "bash -lc 'touch /tmp/hermes-smart-approval-test'"
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"decision":"approve","reason":"The shell wrapper only creates a harmless temporary marker file. '
+                'It does not affect services, credentials, or network state."}'
+            )))]
+        )
+        token = set_current_session_key("test-smart-rationale")
+        try:
+            with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "smart"}}), \
+                 mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False), \
+                 mock_patch("agent.auxiliary_client.call_llm", return_value=response):
+                result = check_all_command_guards(
+                    command,
+                    "local",
+                    approval_callback=lambda *_args, **_kwargs: "deny",
+                )
+        finally:
+            reset_current_session_key(token)
+
+        assert result["approved"] is True
+        assert result.get("smart_approved") is True
+        assert "temporary marker file" in result.get("approval_reason", "")
 
 
 class TestAutoApprovalMode:
@@ -60,7 +101,7 @@ class TestAutoApprovalMode:
         assert "read-only" in result.get("description", "")
 
     def test_auto_mode_does_not_auto_approve_shell_wrapper_with_recursive_delete(self):
-        command = "bash -lc 'rm -rf /tmp/hermes-approval-test'"
+        command = "rm -rf ./build"
         with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "auto"}}), \
              mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False):
             result = check_all_command_guards(

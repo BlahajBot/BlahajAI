@@ -1892,7 +1892,10 @@ def terminal_tool(
                 approval_note = f"Command required approval ({desc}) and was approved by the user."
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
+                reason = approval.get("approval_reason")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+                if reason:
+                    approval_note += f" Rationale: {reason}"
             elif approval.get("auto_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged and auto-approved by deterministic approval ({desc})."

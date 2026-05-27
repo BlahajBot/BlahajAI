@@ -9,6 +9,7 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+import json
 import logging
 import os
 import re
@@ -1035,11 +1036,58 @@ def _deterministic_auto_approval(command: str, warnings: list[tuple[str, str, bo
     return None
 
 
-def _smart_approve(command: str, description: str) -> str:
+_SMART_APPROVAL_DECISIONS = {"approve", "deny", "escalate"}
+
+
+def _smart_approval_result(decision: str, reason: str) -> dict:
+    """Build a normalized smart-approval result."""
+    normalized_decision = (decision or "escalate").strip().lower()
+    if normalized_decision not in _SMART_APPROVAL_DECISIONS:
+        normalized_decision = "escalate"
+    normalized_reason = " ".join((reason or "").strip().split())
+    if not normalized_reason:
+        normalized_reason = "No rationale was provided; escalating to the user."
+    # Keep tool results compact and avoid letting a verbose reviewer bloat the
+    # terminal result. The prompt asks for two sentences; this is a hard cap.
+    if len(normalized_reason) > 500:
+        normalized_reason = normalized_reason[:497].rstrip() + "..."
+    return {"decision": normalized_decision, "reason": normalized_reason}
+
+
+def _parse_smart_approval_response(content: str) -> dict:
+    """Parse the auxiliary reviewer JSON response.
+
+    The old substring parser treated strings like ``DO NOT APPROVE`` as an
+    approval. Require a real JSON object instead; malformed output escalates
+    to the user rather than guessing.
+    """
+    try:
+        payload = json.loads((content or "").strip())
+    except Exception:
+        return _smart_approval_result(
+            "escalate",
+            "Smart approval returned invalid structured JSON; escalating to the user.",
+        )
+    if not isinstance(payload, dict):
+        return _smart_approval_result(
+            "escalate",
+            "Smart approval returned non-object structured JSON; escalating to the user.",
+        )
+    decision = str(payload.get("decision", "")).strip().lower()
+    reason = str(payload.get("reason", "")).strip()
+    if decision not in _SMART_APPROVAL_DECISIONS:
+        return _smart_approval_result(
+            "escalate",
+            "Smart approval returned an invalid decision; escalating to the user.",
+        )
+    return _smart_approval_result(decision, reason)
+
+
+def _smart_approve(command: str, description: str) -> dict:
     """Use the auxiliary LLM to assess risk and decide approval.
 
-    Returns 'approve' if the LLM determines the command is safe,
-    'deny' if genuinely dangerous, or 'escalate' if uncertain.
+    Returns {"decision": "approve"|"deny"|"escalate", "reason": str}.
+    Malformed or uncertain responses escalate to a human approval prompt.
 
     Inspired by OpenAI Codex's Smart Approvals guardian subagent
     (openai/codex#13860).
@@ -1055,31 +1103,29 @@ Flagged reason: {description}
 Assess the ACTUAL risk of this command. Many flagged commands are false positives — for example, `python -c "print('hello')"` is flagged as "script execution via -c flag" but is completely harmless.
 
 Rules:
-- APPROVE if the command is clearly safe (benign script execution, safe file operations, development tools, package installs, git operations, etc.)
-- DENY if the command could genuinely damage the system (recursive delete of important paths, overwriting system files, fork bombs, wiping disks, dropping databases, etc.)
-- ESCALATE if you're uncertain
+- Use "approve" only if the command is clearly safe and has no meaningful destructive, privilege, credential, persistence, or network-piped execution risk.
+- Use "deny" if the command could genuinely damage the system, destroy data, weaken security, overwrite sensitive files, wipe disks, drop databases, fork bomb, or kill critical services.
+- Use "escalate" if you are uncertain, the command is ambiguous, or approval depends on user intent.
 
-Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
+Return exactly one JSON object and no markdown:
+{{"decision":"approve|deny|escalate","reason":"One or two short sentences explaining the decision."}}"""
 
         response = call_llm(
             task="approval",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=16,
+            max_tokens=128,
         )
 
-        answer = (response.choices[0].message.content or "").strip().upper()
-
-        if "APPROVE" in answer:
-            return "approve"
-        elif "DENY" in answer:
-            return "deny"
-        else:
-            return "escalate"
+        answer = response.choices[0].message.content or ""
+        return _parse_smart_approval_response(answer)
 
     except Exception as e:
         logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
-        return "escalate"
+        return _smart_approval_result(
+            "escalate",
+            "Smart approval failed to run; escalating to the user.",
+        )
 
 
 def check_dangerous_command(command: str, env_type: str,
@@ -1340,23 +1386,29 @@ def check_all_command_guards(command: str, env_type: str,
     # (openai/codex#13860).
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
-        verdict = _smart_approve(command, combined_desc_for_llm)
+        smart_result = _smart_approve(command, combined_desc_for_llm)
+        verdict = smart_result.get("decision", "escalate")
+        approval_reason = smart_result.get("reason", "")
         if verdict == "approve":
             # Auto-approve and grant session-level approval for these patterns
             for key, _, _ in warnings:
                 approve_session(session_key, key)
-            logger.debug("Smart approval: auto-approved '%s' (%s)",
-                         command[:60], combined_desc_for_llm)
+            logger.debug("Smart approval: auto-approved '%s' (%s): %s",
+                         command[:60], combined_desc_for_llm, approval_reason)
             return {"approved": True, "message": None,
                     "smart_approved": True,
-                    "description": combined_desc_for_llm}
+                    "description": combined_desc_for_llm,
+                    "approval_reason": approval_reason}
         elif verdict == "deny":
             combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
+            rationale = f" Rationale: {approval_reason}" if approval_reason else ""
             return {
                 "approved": False,
                 "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
-                           "The command was assessed as genuinely dangerous. Do NOT retry.",
+                           f"The command was assessed as genuinely dangerous.{rationale} "
+                           "Do NOT retry.",
                 "smart_denied": True,
+                "approval_reason": approval_reason,
             }
         # verdict == "escalate" → fall through to manual prompt
 
