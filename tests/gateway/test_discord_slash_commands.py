@@ -75,7 +75,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 class FakeTree:
@@ -727,7 +727,7 @@ def test_register_slash_commands_skips_skill_registration_when_disabled(adapter,
     """Disabling native skill registration should leave built-in slash commands intact."""
     monkeypatch.setenv("DISCORD_REGISTER_SKILL_COMMANDS", "false")
 
-    with patch("gateway.platforms.discord.DiscordAdapter._register_skill_group") as mock_skill_group:
+    with patch("plugins.platforms.discord.adapter.DiscordAdapter._register_skill_group") as mock_skill_group:
         adapter._register_slash_commands()
 
     assert "thread" in adapter._client.tree.commands
@@ -935,4 +935,3 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
     # (covered in other tests). The autocomplete filter itself is exercised
     # via direct function call in the real-discord integration path.
     assert skill_cmd.callback is not None
-
