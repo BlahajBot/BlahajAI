@@ -1276,6 +1276,7 @@ Assess the ACTUAL risk of this command. Many flagged commands are false positive
 
 Rules:
 - Use "approve" only if the command is clearly safe and has no meaningful destructive, privilege, credential, persistence, or network-piped execution risk.
+- Treat `/tmp`, `/var/tmp`, and similar system temp directories as temporary scratch space. If a command is narrowly scoped to a specific temp path, do not treat /tmp targets like persistent user data merely because they are files or directories; still deny or escalate for broad wipes, credential exposure, sockets/mounts, privilege changes outside the temp path, or unclear intent.
 - Use "deny" if the command could genuinely damage the system, destroy data, weaken security, overwrite sensitive files, wipe disks, drop databases, fork bomb, or kill critical services.
 - Use "escalate" if you are uncertain, the command is ambiguous, or approval depends on user intent.
 

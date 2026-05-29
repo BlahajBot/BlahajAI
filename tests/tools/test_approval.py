@@ -66,6 +66,22 @@ class TestSmartApproval:
         assert "cwd: /tmp/hermes-approval" in prompt
         assert "marker.txt" in prompt
 
+    def test_smart_approval_prompt_explains_tmp_is_scratch_space(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"decision":"approve","reason":"The command only changes a scratch test path."}'
+            )))]
+        )
+        context = "Local context:\ncwd: /tmp/hermes-approval\nreferenced paths:\n- ./marker -> /tmp/hermes-approval/marker: exists=true; type=dir"
+        with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
+            result = _smart_approve("chmod -R 777 ./marker", "world/other-writable permissions", context=context)
+
+        assert result["decision"] == "approve"
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "/tmp" in prompt
+        assert "temporary scratch space" in prompt
+        assert "do not treat /tmp targets like persistent user data" in prompt
+
     def test_build_smart_approval_context_lists_cwd_with_cap_and_no_contents(self, tmp_path):
         for idx in range(5):
             (tmp_path / f"file-{idx}.txt").write_text(f"secret-content-{idx}")
