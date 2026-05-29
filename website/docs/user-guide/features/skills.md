@@ -411,7 +411,7 @@ hermes skills tap add myorg/skills-repo           # Add a custom GitHub source
 | `well-known` | `well-known:https://mintlify.com/docs/.well-known/skills/mintlify` | Skills served directly from `/.well-known/skills/index.json` on a website. Search using the site or docs URL. |
 | `url` | `https://sharethis.chat/SKILL.md` | Direct HTTP(S) URL to a single-file `SKILL.md`. Name resolution: frontmatter → URL slug → interactive prompt → `--name` flag. |
 | `github` | `openai/skills/k8s` | Direct GitHub repo/path installs and custom taps. |
-| `clawhub`, `lobehub`, `browse-sh`, `claude-marketplace` | Source-specific identifiers | Community or marketplace integrations. |
+| `clawhub`, `lobehub`, `browse-sh` | Source-specific identifiers | Community or marketplace integrations. |
 
 ### Integrated hubs and registries
 
@@ -419,7 +419,7 @@ Hermes currently integrates with these skills ecosystems and discovery sources:
 
 #### 1. Official optional skills (`official`)
 
-These are maintained in the Hermes repository itself and install with builtin trust.
+These are maintained in the Hermes repository itself and install with built-in trust.
 
 - Catalog: [Official Optional Skills Catalog](../../reference/optional-skills-catalog)
 - Source in repo: `optional-skills/`
@@ -569,14 +569,14 @@ hermes skills install skills-sh/anthropics/skills/pdf --force
 Important behavior:
 - `--force` can override policy blocks for caution/warn-style findings.
 - `--force` does **not** override a `dangerous` scan verdict.
-- Official optional skills (`official/...`) are treated as builtin trust and do not show the third-party warning panel.
+- Official optional skills (`official/...`) are treated as built-in trust and do not show the third-party warning panel.
 
 ### Trust levels
 
 | Level | Source | Policy |
 |-------|--------|--------|
 | `builtin` | Ships with Hermes | Always trusted |
-| `official` | `optional-skills/` in the repo | Builtin trust, no third-party warning |
+| `official` | `optional-skills/` in the repo | Built-in trust, no third-party warning |
 | `trusted` | Trusted registries/repos such as `openai/skills`, `anthropics/skills`, `huggingface/skills` | More permissive policy than community sources |
 | `community` | Everything else (`skills.sh`, well-known endpoints, custom GitHub repos, most marketplaces) | Non-dangerous findings can be overridden with `--force`; `dangerous` verdicts stay blocked |
 

@@ -73,6 +73,7 @@ from tools.tool_backend_helpers import (
     coerce_modal_mode,
     has_direct_modal_credentials,
     managed_nous_tools_enabled,
+    nous_tool_gateway_unavailable_message,
     resolve_modal_backend_state,
 )
 
@@ -1000,6 +1001,59 @@ _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
 _cleanup_running = False
 
+# Once-per-process guard for the docker orphan reaper (issue #20561).
+# Set when _maybe_reap_docker_orphans first runs; concurrent _create_environment
+# calls for parallel subagents won't re-trigger the sweep.
+_docker_orphan_reaper_ran = False
+_docker_orphan_reaper_lock = threading.Lock()
+
+
+def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
+    """Run the docker orphan reaper once per process, if enabled.
+
+    Sweeps long-Exited containers labeled ``hermes-agent=1`` for the current
+    profile that match the issue #20561 leak class — containers left behind
+    by Hermes processes that exited without firing ``atexit`` (SIGKILL,
+    OOM, terminal-window-close). The reaper is conservative by default:
+    only Exited containers older than ``2 × lifetime_seconds`` and scoped to
+    the current profile.
+    """
+    global _docker_orphan_reaper_ran
+    if not container_config.get("docker_orphan_reaper", True):
+        return
+    if _docker_orphan_reaper_ran:
+        return
+    with _docker_orphan_reaper_lock:
+        if _docker_orphan_reaper_ran:
+            return
+        _docker_orphan_reaper_ran = True
+
+    try:
+        lifetime = int(os.getenv("TERMINAL_LIFETIME_SECONDS", "300"))
+    except (TypeError, ValueError):
+        lifetime = 300
+    lifetime = max(60, lifetime)
+    max_age = lifetime * 2
+
+    try:
+        from tools.environments.docker import (
+            reap_orphan_containers, _get_active_profile_name,
+        )
+    except ImportError:
+        return
+    try:
+        profile = _get_active_profile_name()
+        removed = reap_orphan_containers(
+            max_age_seconds=max_age, profile_filter=profile,
+        )
+        if removed:
+            logger.info(
+                "Docker orphan reaper removed %d stale container(s) for profile %s",
+                removed, profile,
+            )
+    except Exception as e:
+        logger.debug("Docker orphan reaper raised: %s", e)
+
 # Per-task environment overrides registry.
 # Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal
 # image for a specific task_id BEFORE the agent loop starts. When the terminal or
@@ -1166,6 +1220,12 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_env": _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON"),
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
         "docker_extra_args": _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON"),
+        "docker_persist_across_processes": os.getenv(
+            "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
+        ).lower() in {"true", "1", "yes"},
+        "docker_orphan_reaper": os.getenv(
+            "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
+        ).lower() in {"true", "1", "yes"},
     }
 
 
@@ -1214,6 +1274,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
     
     elif env_type == "docker":
+        # One-shot orphan reaper: clean up labeled containers left behind by
+        # prior Hermes processes that hit SIGKILL / OOM / a closed terminal
+        # before the atexit cleanup hook could run. Gated to once per process.
+        _maybe_reap_docker_orphans(cc)
         return _DockerEnvironment(
             image=image, cwd=cwd, timeout=timeout,
             cpu=cpu, memory=memory, disk=disk,
@@ -1225,6 +1289,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
             extra_args=docker_extra_args,
+            persist_across_processes=cc.get("docker_persist_across_processes", True),
         )
     
     elif env_type == "singularity":
@@ -1261,13 +1326,19 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             if modal_state["managed_mode_blocked"]:
                 raise ValueError(
                     "Modal backend is configured for managed mode, but "
-                    "a paid Nous subscription is required for the Tool Gateway and no direct "
-                    "Modal credentials/config were found. Log in with `hermes model` or "
-                    "choose TERMINAL_MODAL_MODE=direct/auto."
+                    "Nous Tool Gateway access is not currently available and no direct "
+                    "Modal credentials/config were found. "
+                    + nous_tool_gateway_unavailable_message(
+                        "managed Modal execution",
+                    )
+                    + " Choose TERMINAL_MODAL_MODE=direct/auto to use direct Modal credentials."
                 )
             if modal_state["mode"] == "managed":
                 raise ValueError(
-                    "Modal backend is configured for managed mode, but the managed tool gateway is unavailable."
+                    "Modal backend is configured for managed mode, but the managed tool gateway is unavailable. "
+                    + nous_tool_gateway_unavailable_message(
+                        "managed Modal execution",
+                    )
                 )
             if modal_state["mode"] == "direct":
                 raise ValueError(
@@ -1481,8 +1552,12 @@ def cleanup_all_environments():
     return cleaned
 
 
-def cleanup_vm(task_id: str):
-    """Manually clean up a specific environment by task_id."""
+def cleanup_vm(task_id: str, *, force_remove: bool = False):
+    """Manually clean up a specific environment by task_id.
+
+    *force_remove* is forwarded to backends that accept it (currently Docker).
+    The default preserves persistent containers across normal session teardown.
+    """
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
@@ -1507,7 +1582,12 @@ def cleanup_vm(task_id: str):
 
     try:
         if hasattr(env, 'cleanup'):
-            env.cleanup()
+            import inspect
+            sig = inspect.signature(env.cleanup)
+            if "force_remove" in sig.parameters:
+                env.cleanup(force_remove=force_remove)
+            else:
+                env.cleanup()
         elif hasattr(env, 'stop'):
             env.stop()
         elif hasattr(env, 'terminate'):
@@ -1529,7 +1609,16 @@ def _atexit_cleanup():
     if _active_environments:
         count = len(_active_environments)
         logger.info("Shutting down %d remaining sandbox(es)...", count)
+        envs_to_wait = list(_active_environments.values())
         cleanup_all_environments()
+        for env in envs_to_wait:
+            wait_fn = getattr(env, "wait_for_cleanup", None)
+            if wait_fn is None:
+                continue
+            try:
+                wait_fn(timeout=15.0)
+            except Exception as e:
+                logger.debug("wait_for_cleanup raised on exit: %s", e)
 
 atexit.register(_atexit_cleanup)
 
@@ -1898,6 +1987,8 @@ def terminal_tool(
                                 "docker_env": config.get("docker_env", {}),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                                 "docker_extra_args": config.get("docker_extra_args", []),
+                                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+                                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
                             }
 
                         local_config = None
@@ -2034,6 +2125,46 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+
+                # Nudge: background=True without notify_on_complete=True OR
+                # watch_patterns is a silent process. Bounded tasks (tests,
+                # builds, deploys, CI pollers) should almost always opt in to
+                # completion notification so the agent does not forget to poll.
+                if background and not notify_on_complete and not watch_patterns:
+                    result_data["hint"] = (
+                        "background=true without notify_on_complete=true means "
+                        "this process runs SILENTLY — you will not be told when "
+                        "it exits. If this is a bounded task (test suite, build, "
+                        "CI poller, deploy, anything with a defined end), you "
+                        "almost certainly wanted notify_on_complete=true so the "
+                        "system pings you on exit. Re-launch with "
+                        "notify_on_complete=true, or call process(action='poll') "
+                        "/ process(action='wait') yourself to learn the outcome. "
+                        "Only ignore this hint for genuine long-lived processes "
+                        "that never exit (servers, watchers, daemons)."
+                    )
+
+                if background and command:
+                    _gh = ("gh pr view" in command or "gh pr checks" in command)
+                    _has_jq = (
+                        " jq " in command or "| jq" in command or "$(jq" in command
+                    )
+                    _bad_shape = "statusCheckRollup" in command or (_gh and _has_jq)
+                    if _bad_shape:
+                        existing = result_data.get("hint", "")
+                        canonical_hint = (
+                            "This looks like a homebrewed CI poller built from "
+                            "`gh pr view --json statusCheckRollup` and/or "
+                            "`gh pr checks | jq`. Use the canonical snippets in "
+                            "the green-ci-policy skill instead: drive `gh pr "
+                            "checks` from exit codes, or use a tab-separated "
+                            "column-2 pending check with awk; avoid jq/null "
+                            "conclusion parsing and buffered background stdout loops."
+                        )
+                        result_data["hint"] = (
+                            existing + "\n\n" + canonical_hint if existing
+                            else canonical_hint
+                        )
 
                 # Populate routing metadata on the session so that
                 # watch-pattern and completion notifications can be
@@ -2269,16 +2400,21 @@ def check_terminal_requirements() -> bool:
                 if modal_state["managed_mode_blocked"]:
                     logger.error(
                         "Modal backend selected with TERMINAL_MODAL_MODE=managed, but "
-                        "a paid Nous subscription is required for the Tool Gateway and no direct "
-                        "Modal credentials/config were found. Log in with `hermes model` "
-                        "or choose TERMINAL_MODAL_MODE=direct/auto."
+                        "Nous Tool Gateway access is not currently available and no direct "
+                        "Modal credentials/config were found. %s Choose "
+                        "TERMINAL_MODAL_MODE=direct/auto to use direct Modal credentials.",
+                        nous_tool_gateway_unavailable_message(
+                            "managed Modal execution",
+                        ),
                     )
                     return False
                 if modal_state["mode"] == "managed":
                     logger.error(
                         "Modal backend selected with TERMINAL_MODAL_MODE=managed, but the managed "
-                        "tool gateway is unavailable. Configure the managed gateway or choose "
-                        "TERMINAL_MODAL_MODE=direct/auto."
+                        "tool gateway is unavailable. %s",
+                        nous_tool_gateway_unavailable_message(
+                            "managed Modal execution",
+                        ),
                     )
                     return False
                 elif modal_state["mode"] == "direct":
@@ -2398,7 +2534,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background. Two patterns: (1) Long-lived processes that never exit (servers, watchers). (2) Long-running tasks paired with notify_on_complete=true — you can keep working and get notified when the task finishes. For short commands, prefer foreground with a generous timeout instead.",
+                "description": "Run the command in the background. Almost always pair with notify_on_complete=true — without it, the process runs silently and you'll have no way to learn it finished short of calling process(action='poll') yourself (easy to forget, leading to silent blindness on long jobs). Two legitimate patterns: (1) Long-lived processes that never exit (servers, watchers, daemons) — these stay silent because there's no exit to notify on. (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — these MUST set notify_on_complete=true. For short commands, prefer foreground with a generous timeout instead.",
                 "default": False
             },
             "timeout": {
