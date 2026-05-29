@@ -10,6 +10,7 @@ from tools.approval import (
     _get_approval_mode,
     _smart_approve,
     approve_session,
+    build_smart_approval_context,
     check_all_command_guards,
     detect_dangerous_command,
     is_approved,
@@ -49,6 +50,63 @@ class TestSmartApproval:
         assert mock_call.call_args.kwargs["temperature"] == 0
         assert mock_call.call_args.kwargs["max_tokens"] == 128
 
+    def test_smart_approval_prompt_includes_minimal_local_context(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"decision":"approve","reason":"The context shows only a temp target."}'
+            )))]
+        )
+        context = "Local context:\ncwd: /tmp/hermes-approval\ncwd listing: marker.txt"
+        with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
+            result = _smart_approve("chmod -R 777 ./marker.txt", "world/other-writable permissions", context=context)
+
+        assert result["decision"] == "approve"
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "Local context:" in prompt
+        assert "cwd: /tmp/hermes-approval" in prompt
+        assert "marker.txt" in prompt
+
+    def test_build_smart_approval_context_lists_cwd_with_cap_and_no_contents(self, tmp_path):
+        for idx in range(5):
+            (tmp_path / f"file-{idx}.txt").write_text(f"secret-content-{idx}")
+        (tmp_path / "cache").mkdir()
+
+        context = build_smart_approval_context("rm -rf *", str(tmp_path), max_entries=3)
+
+        assert f"cwd: {tmp_path}" in context
+        assert "cwd listing" in context
+        assert "file-0.txt" in context
+        assert "... truncated" in context
+        assert "secret-content" not in context
+        assert "glob expansions" in context
+        assert "* matches" in context
+
+    def test_build_smart_approval_context_summarizes_referenced_paths(self, tmp_path):
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "item.txt").write_text("do not leak this file content")
+        (tmp_path / "plain.txt").write_text("plain secret")
+        (tmp_path / "link.txt").symlink_to("plain.txt")
+
+        context = build_smart_approval_context(
+            "chmod -R 777 ./cache ./missing.txt ./link.txt",
+            str(tmp_path),
+            max_entries=20,
+        )
+
+        assert "referenced paths" in context
+        assert "./cache ->" in context
+        assert "exists=true" in context
+        assert "type=dir" in context
+        assert "children=1" in context
+        assert "./missing.txt ->" in context
+        assert "exists=false" in context
+        assert "./link.txt ->" in context
+        assert "type=symlink" in context
+        assert "target=plain.txt" in context
+        assert "do not leak" not in context
+        assert "plain secret" not in context
+
     def test_smart_approval_rejects_loose_substring_approve_text(self):
         response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="DO NOT APPROVE"))]
@@ -83,6 +141,60 @@ class TestSmartApproval:
         assert result["approved"] is True
         assert result.get("smart_approved") is True
         assert "temporary marker file" in result.get("approval_reason", "")
+
+    def test_smart_mode_passes_cwd_context_to_reviewer(self, tmp_path):
+        (tmp_path / "marker.txt").write_text("do not leak marker contents")
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"decision":"approve","reason":"The context shows a local marker file."}'
+            )))]
+        )
+        token = set_current_session_key("test-smart-cwd-context")
+        try:
+            with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "smart"}}), \
+                 mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False), \
+                 mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
+                result = check_all_command_guards(
+                    "chmod -R 777 ./marker.txt",
+                    "local",
+                    approval_callback=lambda *_args, **_kwargs: "deny",
+                    cwd=str(tmp_path),
+                )
+        finally:
+            reset_current_session_key(token)
+
+        assert result["approved"] is True
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert f"cwd: {tmp_path}" in prompt
+        assert "marker.txt" in prompt
+        assert "do not leak" not in prompt
+
+    def test_smart_mode_preserves_escalation_rationale_after_user_approval(self):
+        command = "bash -lc 'nmap -sV 192.0.2.10'"
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"decision":"escalate","reason":"The command performs network service probing. '
+                'User intent and authorization should be confirmed before execution."}'
+            )))]
+        )
+        token = set_current_session_key("test-smart-escalation-rationale")
+        try:
+            with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "smart"}}), \
+                 mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False), \
+                 mock_patch("agent.auxiliary_client.call_llm", return_value=response):
+                result = check_all_command_guards(
+                    command,
+                    "local",
+                    approval_callback=lambda *_args, **_kwargs: "once",
+                )
+        finally:
+            reset_current_session_key(token)
+
+        assert result["approved"] is True
+        assert result.get("user_approved") is True
+        assert result.get("smart_escalated") is True
+        assert result.get("smart_approval_decision") == "escalate"
+        assert "network service probing" in result.get("approval_reason", "")
 
 
 class TestAutoApprovalMode:

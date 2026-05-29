@@ -41,6 +41,7 @@ from tools.terminal_tool import (
     _get_approval_callback,
     _get_sudo_password_callback,
     set_approval_callback as _set_approval_callback,
+    set_approval_progress_callback as _set_approval_progress_callback,
     set_sudo_password_callback as _set_sudo_password_callback,
     get_active_env,
 )
@@ -232,6 +233,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _set_sudo_password_callback(_parent_sudo_cb)
             except Exception:
                 pass
+        if agent.tool_progress_callback is not None:
+            try:
+                _set_approval_progress_callback(agent.tool_progress_callback)
+            except Exception:
+                pass
         start = time.time()
         try:
             result = agent._invoke_tool(
@@ -265,6 +271,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # doesn't hold stale references to a disposed CLI instance.
         try:
             _set_approval_callback(None)
+            _set_approval_progress_callback(None)
             _set_sudo_password_callback(None)
         except Exception:
             pass
@@ -545,6 +552,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 from tools.environments.base import set_activity_callback
                 set_activity_callback(agent._touch_activity)
+            except Exception:
+                pass
+            try:
+                _set_approval_progress_callback(agent.tool_progress_callback)
             except Exception:
                 pass
 
@@ -841,6 +852,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
+
+        try:
+            _set_approval_progress_callback(None)
+        except Exception:
+            pass
 
         function_result = maybe_persist_tool_result(
             content=function_result,

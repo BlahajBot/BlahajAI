@@ -9,6 +9,7 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+import glob
 import json
 import logging
 import os
@@ -1083,7 +1084,174 @@ def _parse_smart_approval_response(content: str) -> dict:
     return _smart_approval_result(decision, reason)
 
 
-def _smart_approve(command: str, description: str) -> dict:
+_SMART_APPROVAL_CONTEXT_MAX_ENTRIES = 50
+_SMART_APPROVAL_CONTEXT_MAX_PATHS = 25
+
+
+def _smart_context_shell_tokens(command: str) -> list[str]:
+    """Best-effort tokenization for local file context, not command judging."""
+    tokens: list[str] = []
+    try:
+        tokens.extend(str(tok) for tok in shlex.split(command, posix=True) if tok)
+    except ValueError:
+        pass
+    tokens.extend(re.findall(r"[^\s'\"`;&|<>()]+", command))
+    seen: set[str] = set()
+    unique: list[str] = []
+    for tok in tokens:
+        tok = tok.strip()
+        if tok and tok not in seen:
+            seen.add(tok)
+            unique.append(tok)
+    return unique
+
+
+def _smart_context_resolve_path(token: str, cwd: str) -> str:
+    expanded = os.path.expanduser(token.rstrip(",:"))
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    return os.path.normpath(os.path.join(cwd, expanded))
+
+
+def _smart_context_path_type(path: str) -> str:
+    if not os.path.lexists(path):
+        return "missing"
+    if os.path.islink(path):
+        return "symlink"
+    if os.path.isdir(path):
+        return "dir"
+    if os.path.isfile(path):
+        return "file"
+    if os.path.ismount(path):
+        return "mount"
+    return "other"
+
+
+def _smart_context_entry_label(path: str) -> str:
+    name = os.path.basename(path.rstrip(os.sep)) or path
+    typ = _smart_context_path_type(path)
+    suffix = "/" if typ == "dir" else "@" if typ == "symlink" else ""
+    return f"{name}{suffix}"
+
+
+def _smart_context_list_dir(cwd: str, max_entries: int) -> list[str]:
+    try:
+        entries = sorted(os.scandir(cwd), key=lambda e: e.name.lower())
+    except OSError as exc:
+        return [f"cwd listing unavailable: {exc.__class__.__name__}"]
+    lines = [f"- {_smart_context_entry_label(entry.path)}" for entry in entries[:max_entries]]
+    if len(entries) > max_entries:
+        lines.append(f"- ... truncated ({len(entries) - max_entries} more)")
+    return lines or ["- <empty>"]
+
+
+def _smart_context_is_reference_token(token: str, cwd: str) -> bool:
+    if not token or token.startswith("-") or "://" in token:
+        return False
+    if any(ch in token for ch in "*?["):
+        return False
+    if token in {".", ".."}:
+        return True
+    if token.startswith(("/", "./", "../", "~")) or "/" in token:
+        return True
+    return os.path.lexists(os.path.join(cwd, token))
+
+
+def _smart_context_referenced_tokens(command: str, cwd: str, max_paths: int) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for token in _smart_context_shell_tokens(command):
+        stripped = token.rstrip(",:")
+        if not _smart_context_is_reference_token(stripped, cwd):
+            continue
+        if stripped not in seen:
+            seen.add(stripped)
+            refs.append(stripped)
+        if len(refs) >= max_paths:
+            break
+    return refs
+
+
+def _smart_context_path_summary(token: str, cwd: str) -> str:
+    resolved = _smart_context_resolve_path(token, cwd)
+    typ = _smart_context_path_type(resolved)
+    if typ == "missing":
+        return f"- {token} -> {resolved}: exists=false"
+    parts = [f"- {token} -> {resolved}: exists=true", f"type={typ}"]
+    if typ == "symlink":
+        try:
+            parts.append(f"target={os.readlink(resolved)}")
+        except OSError:
+            pass
+    elif typ == "dir":
+        try:
+            parts.append(f"children={len(os.listdir(resolved))}")
+        except OSError:
+            pass
+    elif typ == "file":
+        try:
+            parts.append(f"size={os.lstat(resolved).st_size}B")
+        except OSError:
+            pass
+    return "; ".join(parts)
+
+
+def _smart_context_glob_summaries(command: str, cwd: str, max_entries: int) -> list[str]:
+    summaries: list[str] = []
+    seen: set[str] = set()
+    for token in _smart_context_shell_tokens(command):
+        stripped = token.rstrip(",:")
+        if not stripped or stripped in seen or "://" in stripped:
+            continue
+        if not any(ch in stripped for ch in "*?["):
+            continue
+        seen.add(stripped)
+        matches = sorted(glob.glob(_smart_context_resolve_path(stripped, cwd)), key=lambda p: p.lower())
+        summaries.append(f"- {stripped} matches {len(matches)} entr{'y' if len(matches) == 1 else 'ies'}")
+        for match in matches[:max_entries]:
+            try:
+                display = os.path.relpath(match, cwd)
+            except ValueError:
+                display = match
+            summaries.append(f"  - {_smart_context_entry_label(match)} ({display})")
+        if len(matches) > max_entries:
+            summaries.append(f"  - ... truncated ({len(matches) - max_entries} more)")
+    return summaries
+
+
+def build_smart_approval_context(command: str, cwd: Optional[str], *, max_entries: int = _SMART_APPROVAL_CONTEXT_MAX_ENTRIES) -> str:
+    """Return tiny local-file context for the LLM approval judge.
+
+    The judge can read command syntax itself. This only supplies local facts it
+    cannot infer: cwd, capped cwd filenames, referenced path facts, and capped
+    glob expansion. It never reads file contents or environment values.
+    """
+    if not cwd:
+        return ""
+    try:
+        cwd = os.path.abspath(os.path.expanduser(str(cwd)))
+        max_entries = max(1, min(int(max_entries), 200))
+    except Exception:
+        return ""
+    max_paths = min(_SMART_APPROVAL_CONTEXT_MAX_PATHS, max_entries)
+
+    lines = ["Local context:", f"cwd: {cwd}", "", "cwd listing:"]
+    lines.extend(_smart_context_list_dir(cwd, max_entries))
+
+    refs = _smart_context_referenced_tokens(command, cwd, max_paths)
+    if refs:
+        lines.extend(["", "referenced paths:"])
+        lines.extend(_smart_context_path_summary(ref, cwd) for ref in refs)
+
+    glob_lines = _smart_context_glob_summaries(command, cwd, max_entries)
+    if glob_lines:
+        lines.extend(["", "glob expansions:"])
+        lines.extend(glob_lines)
+
+    return "\n".join(lines)
+
+
+def _smart_approve(command: str, description: str, context: Optional[str] = None) -> dict:
     """Use the auxiliary LLM to assess risk and decide approval.
 
     Returns {"decision": "approve"|"deny"|"escalate", "reason": str}.
@@ -1095,10 +1263,14 @@ def _smart_approve(command: str, description: str) -> dict:
     try:
         from agent.auxiliary_client import call_llm
 
+        context_block = ""
+        if context:
+            context_block = f"\n\nLocal facts not visible from the command text:\n{context.strip()}"
+
         prompt = f"""You are a security reviewer for an AI coding agent. A terminal command was flagged by pattern matching as potentially dangerous.
 
 Command: {command}
-Flagged reason: {description}
+Flagged reason: {description}{context_block}
 
 Assess the ACTUAL risk of this command. Many flagged commands are false positives — for example, `python -c "print('hello')"` is flagged as "script execution via -c flag" but is completely harmless.
 
@@ -1259,7 +1431,8 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def check_all_command_guards(command: str, env_type: str,
-                             approval_callback=None) -> dict:
+                             approval_callback=None,
+                             cwd: Optional[str] = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -1380,27 +1553,38 @@ def check_all_command_guards(command: str, env_type: str,
                 "description": auto_reason,
             }
 
+    smart_approval_decision = None
+    smart_approval_reason = None
+
     # --- Phase 2.6: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
-        smart_result = _smart_approve(command, combined_desc_for_llm)
+        smart_context = build_smart_approval_context(command, cwd)
+        smart_result = _smart_approve(command, combined_desc_for_llm, context=smart_context)
         verdict = smart_result.get("decision", "escalate")
         approval_reason = smart_result.get("reason", "")
+        smart_approval_decision = verdict
+        smart_approval_reason = approval_reason
+        logger.info(
+            "Smart approval verdict=%s for '%s' (%s): %s",
+            verdict,
+            command[:120],
+            combined_desc_for_llm,
+            approval_reason,
+        )
         if verdict == "approve":
             # Auto-approve and grant session-level approval for these patterns
             for key, _, _ in warnings:
                 approve_session(session_key, key)
-            logger.debug("Smart approval: auto-approved '%s' (%s): %s",
-                         command[:60], combined_desc_for_llm, approval_reason)
             return {"approved": True, "message": None,
                     "smart_approved": True,
+                    "smart_approval_decision": verdict,
                     "description": combined_desc_for_llm,
                     "approval_reason": approval_reason}
         elif verdict == "deny":
-            combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
             rationale = f" Rationale: {approval_reason}" if approval_reason else ""
             return {
                 "approved": False,
@@ -1408,9 +1592,11 @@ def check_all_command_guards(command: str, env_type: str,
                            f"The command was assessed as genuinely dangerous.{rationale} "
                            "Do NOT retry.",
                 "smart_denied": True,
+                "smart_approval_decision": verdict,
                 "approval_reason": approval_reason,
             }
-        # verdict == "escalate" → fall through to manual prompt
+        # verdict == "escalate" → fall through to manual prompt, but keep
+        # the rationale so the approval prompt/tool result can display why.
 
     # --- Phase 3: Approval ---
 
@@ -1419,6 +1605,14 @@ def check_all_command_guards(command: str, env_type: str,
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
     has_tirith = any(is_t for _, _, is_t in warnings)
+    smart_approval_fields = {}
+    if smart_approval_decision:
+        smart_approval_fields = {
+            "smart_approval_decision": smart_approval_decision,
+            "approval_reason": smart_approval_reason or "",
+        }
+        if smart_approval_decision == "escalate":
+            smart_approval_fields["smart_escalated"] = True
 
     # Gateway/async approval — block the agent thread until the user
     # responds with /approve or /deny, mirroring the CLI's synchronous
@@ -1439,6 +1633,7 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_keys": all_keys,
                 "description": combined_desc,
             }
+            approval_data.update(smart_approval_fields)
             entry = _ApprovalEntry(approval_data)
             with _lock:
                 _gateway_queues.setdefault(session_key, []).append(entry)
@@ -1472,6 +1667,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
                     "pattern_key": primary_key,
                     "description": combined_desc,
+                    **smart_approval_fields,
                 }
 
             # Block until the user responds or timeout (default 5 min).
@@ -1546,6 +1742,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "message": f"BLOCKED: Command {reason}. Do NOT retry this command.",
                     "pattern_key": primary_key,
                     "description": combined_desc,
+                    **smart_approval_fields,
                 }
 
             # User approved — persist based on scope (same logic as CLI)
@@ -1560,16 +1757,19 @@ def check_all_command_guards(command: str, env_type: str,
                 # single time only, matching the CLI's behavior.
 
             return {"approved": True, "message": None,
-                    "user_approved": True, "description": combined_desc}
+                    "user_approved": True, "description": combined_desc,
+                    **smart_approval_fields}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Return approval_required for backward compat.
-        submit_pending(session_key, {
+        pending_data = {
             "command": command,
             "pattern_key": primary_key,
             "pattern_keys": all_keys,
             "description": combined_desc,
-        })
+        }
+        pending_data.update(smart_approval_fields)
+        submit_pending(session_key, pending_data)
         return {
             "approved": False,
             "pattern_key": primary_key,
@@ -1577,6 +1777,7 @@ def check_all_command_guards(command: str, env_type: str,
             "approval_pending": True,
             "command": command,
             "description": combined_desc,
+            **smart_approval_fields,
             "message": (
                 f"⚠️ {combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{command}\n```"
             ),
@@ -1613,6 +1814,7 @@ def check_all_command_guards(command: str, env_type: str,
             "message": "BLOCKED: User denied. Do NOT retry.",
             "pattern_key": primary_key,
             "description": combined_desc,
+            **smart_approval_fields,
         }
 
     # Persist approval for each warning individually
@@ -1627,7 +1829,8 @@ def check_all_command_guards(command: str, env_type: str,
             save_permanent_allowlist(_permanent_approved)
 
     return {"approved": True, "message": None,
-            "user_approved": True, "description": combined_desc}
+            "user_approved": True, "description": combined_desc,
+            **smart_approval_fields}
 
 
 # Load permanent allowlist from config on module import

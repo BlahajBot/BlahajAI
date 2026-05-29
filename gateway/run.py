@@ -85,6 +85,26 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+
+def _format_approval_progress_message(args: Optional[dict]) -> Optional[str]:
+    """Render an out-of-band smart-approval audit event for tool progress.
+
+    Smart approval is an auxiliary LLM decision made inside the terminal tool;
+    it is deliberately not a synthetic provider-visible tool call. Keeping this
+    formatter small and standalone makes future upstream merges less fragile:
+    the gateway progress callback only needs to route ``approval.judged`` here.
+    """
+    if not isinstance(args, dict) or args.get("source") != "smart_approval":
+        return None
+    decision = str(args.get("decision") or "").strip().lower()
+    if decision not in {"approve", "deny", "escalate"}:
+        return None
+    reason = str(args.get("reason") or "").strip()
+    msg = f"🛡️ smart approval: {decision}"
+    if reason:
+        msg += f" — {reason}"
+    return msg
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -15990,6 +16010,16 @@ class GatewayRunner:
                 return
 
 
+            # Render out-of-band approval audit events without pretending they
+            # are provider-visible assistant tool calls. This keeps the smart
+            # approval path easy to rebase: terminal emits one stable event and
+            # the gateway owns presentation.
+            if event_type == "approval.judged":
+                msg = _format_approval_progress_message(args)
+                if msg:
+                    progress_queue.put(msg)
+                return
+
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in {"tool.started",}:
                 return
@@ -16959,6 +16989,13 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                smart_decision = approval_data.get("smart_approval_decision")
+                smart_reason = approval_data.get("approval_reason")
+                desc_display = desc
+                if smart_decision:
+                    desc_display = f"{desc}\n\nSmart approval: {smart_decision}"
+                    if smart_reason:
+                        desc_display += f" — {smart_reason}"
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -16970,7 +17007,7 @@ class GatewayRunner:
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
-                                description=desc,
+                                description=desc_display,
                                 metadata=_status_thread_metadata,
                             ),
                             _loop_for_step,
@@ -16996,7 +17033,7 @@ class GatewayRunner:
                 msg = (
                     f"⚠️ **Dangerous command requires approval:**\n"
                     f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
+                    f"Reason: {desc_display}\n\n"
                     f"Reply `/approve` to execute, `/approve session` to approve this pattern "
                     f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
                 )

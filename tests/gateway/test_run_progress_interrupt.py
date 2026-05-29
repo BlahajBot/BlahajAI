@@ -76,6 +76,38 @@ class PreInterruptAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
+class SmartApprovalProgressAgent:
+    """Emits an out-of-band smart-approval progress event.
+
+    This is not a real model tool call, but gateway tool-history should still
+    show the LLM approval judge verdict as an audit/progress line.
+    """
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+        self._interrupt_requested = False
+
+    @property
+    def is_interrupted(self) -> bool:
+        return self._interrupt_requested
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "approval.judged",
+            "terminal",
+            None,
+            {
+                "decision": "approve",
+                "description": "shell command via -c/-lc flag",
+                "reason": "The command only prints a fixed string.",
+                "source": "smart_approval",
+            },
+        )
+        time.sleep(0.35)  # let the drain loop process
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 class InterruptedAgent:
     """Fires tool.started events AFTER interrupt — all should be suppressed.
 
@@ -213,3 +245,20 @@ async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_pa
             f"event '{leaked_query}' leaked into the UI after interrupt — "
             f"progress_callback / drain loop is not checking is_interrupted"
         )
+
+
+@pytest.mark.asyncio
+async def test_smart_approval_progress_event_renders_in_tool_history(monkeypatch, tmp_path):
+    adapter, result = await _run_once(
+        monkeypatch, tmp_path, SmartApprovalProgressAgent, "sess-smart-approval-progress"
+    )
+    assert result["final_response"] == "done"
+
+    rendered = " ".join(c["content"] for c in adapter.sent) + " " + " ".join(
+        c["content"] for c in adapter.edits
+    )
+
+    assert "smart approval" in rendered
+    assert "approve" in rendered
+    assert "prints a fixed string" in rendered
+
