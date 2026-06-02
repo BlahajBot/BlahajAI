@@ -127,6 +127,12 @@ _HERMES_ENV_PATH = (
     r'(?:\$hermes_home|\$\{hermes_home\})/)'
     r'\.env\b'
 )
+_HERMES_CONFIG_PATH = (
+    r'(?:~\/\.hermes/|'
+    r'(?:\$home|\$\{home\})/\.hermes/|'
+    r'(?:\$hermes_home|\$\{hermes_home\})/)'
+    r'config\.yaml\b'
+)
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = (
@@ -152,6 +158,7 @@ _SENSITIVE_WRITE_TARGET = (
     rf'(?:{_SYSTEM_CONFIG_PATH}|/dev/sd|'
     rf'{_SSH_SENSITIVE_PATH}|'
     rf'{_HERMES_ENV_PATH}|'
+    rf'{_HERMES_CONFIG_PATH}|'
     rf'{_SHELL_RC_FILES}|'
     rf'{_CREDENTIAL_FILES})'
 )
@@ -381,8 +388,10 @@ DANGEROUS_PATTERNS = [
     # /private/etc/ mirror).
     (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
     (rf'\b(cp|mv|install)\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config file"),
-    (rf'\bsed\s+-[^\s]*i.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config"),
-    (rf'\bsed\s+--in-place\b.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config (long flag)"),
+    (rf'\bsed\s+-[^\s]*i.*\s["\']?{_SENSITIVE_WRITE_TARGET}', "in-place edit of sensitive config"),
+    (rf'\bsed\s+--in-place\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}', "in-place edit of sensitive config (long flag)"),
+    (rf'\bsed\s+-[^\s]*i.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "in-place edit of project config"),
+    (rf'\bsed\s+--in-place\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "in-place edit of project config (long flag)"),
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
     # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
@@ -1665,7 +1674,9 @@ def check_all_command_guards(command: str, env_type: str,
                         _gateway_queues.pop(session_key, None)
                 return {
                     "approved": False,
-                    "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
+                    "message": "BLOCKED: Failed to send approval request to user; command was NOT consented. Do NOT retry, rephrase, or use a different command for the same action.",
+                    "user_consent": False,
+                    "outcome": "notify_failed",
                     "pattern_key": primary_key,
                     "description": combined_desc,
                     **smart_approval_fields,
@@ -1737,10 +1748,24 @@ def check_all_command_guards(command: str, env_type: str,
             )
 
             if not resolved or choice is None or choice == "deny":
-                reason = "timed out" if not resolved else "denied by user"
+                if not resolved or choice is None:
+                    reason = "timed out"
+                    outcome = "timeout"
+                    consent_note = "Silence is not consent."
+                else:
+                    reason = "denied by user"
+                    outcome = "denied"
+                    consent_note = ""
+                message = (
+                    f"BLOCKED: Command {reason}; command was NOT consented. "
+                    f"{consent_note} Do NOT retry, rephrase, or use a different command "
+                    "for the same action."
+                )
                 return {
                     "approved": False,
-                    "message": f"BLOCKED: Command {reason}. Do NOT retry this command.",
+                    "message": " ".join(message.split()),
+                    "user_consent": False,
+                    "outcome": outcome,
                     "pattern_key": primary_key,
                     "description": combined_desc,
                     **smart_approval_fields,
@@ -1812,7 +1837,9 @@ def check_all_command_guards(command: str, env_type: str,
     if choice == "deny":
         return {
             "approved": False,
-            "message": "BLOCKED: User denied. Do NOT retry.",
+            "message": "BLOCKED: User denied; command was NOT consented. Do NOT retry, rephrase, or use a different command for the same action.",
+            "user_consent": False,
+            "outcome": "denied",
             "pattern_key": primary_key,
             "description": combined_desc,
             **smart_approval_fields,
