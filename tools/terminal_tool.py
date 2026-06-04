@@ -318,6 +318,12 @@ def _get_sudo_password_cache_scope() -> str:
 
         session_key = get_session_env("HERMES_SESSION_KEY", "")
     except Exception:
+        session_key = ""
+    # Sudo cache scoping is intentionally allowed to fall back to the process
+    # env even after gateway contextvars were cleared; CLI/tests mutate
+    # HERMES_SESSION_KEY directly, and an empty contextvar should not collapse
+    # distinct interactive sessions into one thread-local password cache.
+    if not session_key:
         session_key = os.getenv("HERMES_SESSION_KEY", "")
     if session_key:
         return f"session:{session_key}"

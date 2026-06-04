@@ -3128,6 +3128,11 @@ class DiscordAdapter(BasePlatformAdapter):
             for cmd_def in COMMAND_REGISTRY:
                 if not _is_gateway_available(cmd_def, config_overrides):
                     continue
+                # Keep /spark as a plain text command on Discord: its argument
+                # is the user prompt, and native slash options are hidden from
+                # channel history, making the prompt look swallowed.
+                if cmd_def.name == "spark":
+                    continue
                 # Discord command names: lowercase, hyphens OK, max 32 chars.
                 discord_name = cmd_def.name.lower()[:32]
                 if discord_name in already_registered:
