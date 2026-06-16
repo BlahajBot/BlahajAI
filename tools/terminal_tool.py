@@ -3,18 +3,16 @@
 Terminal Tool Module
 
 A terminal tool that executes commands in local, Docker, Modal, SSH,
-Singularity, Daytona, and Vercel Sandbox environments. Supports local
-execution, containerized backends, and cloud sandboxes, including managed
-Modal mode.
+Singularity, and Daytona environments. Supports local execution,
+containerized backends, and cloud sandboxes, including managed Modal mode.
 
-Environment Selection (via TERMINAL_ENV environment variable):
+Supported environments:
 - "local": Execute directly on the host machine (default, fastest)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
-- "vercel_sandbox": Execute in Vercel Sandbox cloud sandboxes
 
 Features:
-- Multiple execution backends (local, docker, modal, vercel_sandbox)
+- Multiple execution backends (local, docker, modal)
 - Background task support
 - VM/container lifecycle management
 - Automatic cleanup after inactivity
@@ -120,68 +118,6 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     float,
     "number",
 )
-_VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
-_SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
-
-
-def _is_supported_vercel_runtime(runtime: str) -> bool:
-    return not runtime or runtime in _SUPPORTED_VERCEL_RUNTIMES
-
-
-def _check_vercel_sandbox_requirements(config: dict[str, Any]) -> bool:
-    """Validate Vercel Sandbox terminal backend requirements."""
-    runtime = (config.get("vercel_runtime") or "").strip()
-    if not _is_supported_vercel_runtime(runtime):
-        supported = ", ".join(_SUPPORTED_VERCEL_RUNTIMES)
-        logger.error(
-            "Vercel Sandbox runtime %r is not supported. "
-            "Set TERMINAL_VERCEL_RUNTIME to one of: %s.",
-            runtime,
-            supported,
-        )
-        return False
-
-    disk = config.get("container_disk", 51200)
-    if disk not in {0, 51200}:
-        logger.error(
-            "Vercel Sandbox does not support custom TERMINAL_CONTAINER_DISK=%s. "
-            "Use the default shared setting (51200 MB).",
-            disk,
-        )
-        return False
-
-    if importlib.util.find_spec("vercel") is None:
-        logger.error(
-            "vercel is required for the Vercel Sandbox terminal backend: pip install vercel"
-        )
-        return False
-
-    has_oidc = bool(os.getenv("VERCEL_OIDC_TOKEN"))
-    has_token = bool(os.getenv("VERCEL_TOKEN"))
-    has_project = bool(os.getenv("VERCEL_PROJECT_ID"))
-    has_team = bool(os.getenv("VERCEL_TEAM_ID"))
-
-    if has_oidc:
-        return True
-
-    if has_token or has_project or has_team:
-        if has_token and has_project and has_team:
-            return True
-        logger.error(
-            "Vercel Sandbox backend selected with token auth, but "
-            "VERCEL_TOKEN, VERCEL_PROJECT_ID, and VERCEL_TEAM_ID must all "
-            "be set together. VERCEL_OIDC_TOKEN is supported for one-off "
-            "local development only."
-        )
-        return False
-
-    logger.error(
-        "Vercel Sandbox backend selected but no supported auth configuration "
-        "was found. Set VERCEL_TOKEN, VERCEL_PROJECT_ID, and VERCEL_TEAM_ID "
-        "for normal use. VERCEL_OIDC_TOKEN is supported for one-off local "
-        "development only."
-    )
-    return False
 
 
 def _check_disk_usage_warning():
@@ -234,7 +170,6 @@ _sudo_password_cache_lock = threading.Lock()
 # own callback exactly like before. Gateway mode resolves approvals via
 # the per-session queue in tools.approval, not through these callbacks,
 # so it's unaffected.
-import threading
 _callback_tls = threading.local()
 
 
@@ -919,12 +854,12 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     should prepend sudo_stdin to their stdin_data and pass the merged bytes to
     Popen's stdin pipe.
 
-    Callers that cannot pipe subprocess stdin (modal, daytona,
-    vercel_sandbox) must embed the password in the command string
-    themselves; see their execute() methods for how they handle the
-    non-None sudo_stdin case.
+    Callers that cannot pipe subprocess stdin (modal, daytona) must embed
+    the password in the command string themselves; see their execute()
+    methods for how they handle the non-None sudo_stdin case.
 
-    If SUDO_PASSWORD is not set and in interactive mode (HERMES_INTERACTIVE=1):
+    If SUDO_PASSWORD is not set and an interactive UI is available
+    (HERMES_INTERACTIVE=1 or a registered sudo password callback):
       Prompts user for password with 45s timeout, caches for session.
 
     If SUDO_PASSWORD is not set and NOT interactive:
@@ -952,7 +887,11 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     if not has_configured_password and not sudo_password and _sudo_nopasswd_works():
         return command, None
 
-    if not has_configured_password and not sudo_password and env_var_enabled("HERMES_INTERACTIVE"):
+    has_sudo_prompt_callback = _get_sudo_password_callback() is not None
+    should_prompt_for_sudo = (
+        env_var_enabled("HERMES_INTERACTIVE") or has_sudo_prompt_callback
+    )
+    if not has_configured_password and not sudo_password and should_prompt_for_sudo:
         sudo_password = _prompt_for_sudo_password(timeout_seconds=45)
         if sudo_password:
             _set_cached_sudo_password(sudo_password)
@@ -976,7 +915,7 @@ import sys
 
 
 # Tool description for LLM
-TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem usually persists between calls.
+TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.
 
 Do NOT use cat/head/tail to read files — use read_file instead.
 Do NOT use grep/rg/find to search — use search_files instead.
@@ -984,11 +923,12 @@ Do NOT use ls to list directories — use search_files(target='files') instead.
 Do NOT use sed/awk to edit files — use patch instead.
 Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
+Because exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.
 
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
-Background: Set background=true to get a session_id. Two patterns:
-  (1) Long-lived processes that never exit (servers, watchers).
-  (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
+Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
+  (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.
+  (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
@@ -1023,10 +963,22 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     OOM, terminal-window-close). The reaper is conservative by default:
     only Exited containers older than ``2 × lifetime_seconds`` and scoped to
     the current profile.
+
+    Gates:
+
+    * ``terminal.docker_orphan_reaper: false`` disables it entirely (the
+      operator opted out — usually because they're running multiple
+      Hermes processes in the same profile and don't trust the
+      conservative defaults).
+    * ``_docker_orphan_reaper_ran`` flag — sweep runs once per Python
+      interpreter, not on every subagent / RL-rollout / parallel
+      ``terminal()`` call.
     """
     global _docker_orphan_reaper_ran
     if not container_config.get("docker_orphan_reaper", True):
         return
+    # Cheap double-checked-locking: read without the lock, take the lock
+    # only on first run, recheck inside.
     if _docker_orphan_reaper_ran:
         return
     with _docker_orphan_reaper_lock:
@@ -1034,6 +986,11 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
             return
         _docker_orphan_reaper_ran = True
 
+    # 2 × lifetime_seconds gives sibling Hermes processes a generous grace
+    # window. Floor at 60s so an operator with TERMINAL_LIFETIME_SECONDS=0
+    # doesn't get an instant-reap that races their own setup.
+    # ``container_config`` only carries container_* keys, so read
+    # lifetime_seconds from the env var the rest of the module uses.
     try:
         lifetime = int(os.getenv("TERMINAL_LIFETIME_SECONDS", "300"))
     except (TypeError, ValueError):
@@ -1058,7 +1015,9 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
                 removed, profile,
             )
     except Exception as e:
+        # Never fail the env-creation path because of a janitor problem.
         logger.debug("Docker orphan reaper raised: %s", e)
+
 
 # Per-task environment overrides registry.
 # Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal
@@ -1089,6 +1048,28 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     """
     _task_env_overrides[task_id] = overrides
 
+    # If a live environment already exists for this task, a freshly registered
+    # ``cwd`` override (e.g. the ACP client switching the editor's project root
+    # mid-session via ``session/load`` / ``session/resume``) must take effect on
+    # the cached env too. ``terminal_tool`` resolves the per-command cwd as
+    # ``workdir > env.cwd > config/override cwd`` so that ordinary in-session
+    # ``cd`` state is preserved; without syncing here the override would sit
+    # below the (already-set) ``env.cwd`` and be silently ignored once any
+    # command has run. Pushing it onto the live env keeps ``cd`` tracking intact
+    # while letting an explicit ACP cwd change win, as the client expects.
+    new_cwd = overrides.get("cwd")
+    if isinstance(new_cwd, str) and new_cwd.strip():
+        # The live env is cached under the raw task_id for per-session surfaces
+        # (ACP/gateway/dashboard) and under the collapsed container id for
+        # isolation-keyed rollouts. Try the raw id first, then the container id,
+        # so a CWD-only override (which collapses to "default") still finds and
+        # updates the originating session's env.
+        container_id = _resolve_container_task_id(task_id)
+        with _env_lock:
+            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+        if env is not None and getattr(env, "cwd", None) is not None:
+            env.cwd = new_cwd
+
 
 def clear_task_env_overrides(task_id: str):
     """
@@ -1117,15 +1098,46 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     task_id, we honour it by returning the task_id unchanged -- those
     rollouts need their own isolated sandbox, which is the whole point of
     the override.
+
+    CWD-only overrides (registered by the ACP adapter for workspace
+    tracking) are *not* isolation signals — they should not cause each
+    session to spin up its own container.  Only overrides containing
+    backend-specific image keys or ``env_type`` trigger isolation.
     """
+    _ISOLATION_KEYS = frozenset({
+        "docker_image", "modal_image", "singularity_image",
+        "daytona_image", "env_type",
+    })
     if task_id and task_id in _task_env_overrides:
-        return task_id
+        overrides = _task_env_overrides[task_id]
+        if set(overrides.keys()) & _ISOLATION_KEYS:
+            return task_id
     return "default"
+
+
+def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
+    """Return the env overrides for *task_id*, raw key first then collapsed.
+
+    ``register_task_env_overrides`` writes under the *raw* task/session id, but
+    a CWD-only override collapses (:func:`_resolve_container_task_id`) to the
+    shared ``"default"`` container so per-session surfaces (ACP/gateway/
+    dashboard) don't each spin up their own sandbox. Callers that need the
+    override (terminal command setup, file-tool cwd resolution) must therefore
+    read the raw id FIRST and only fall back to the collapsed container id, or
+    the originating session's override is silently dropped. This is the single
+    source of that lookup so the terminal and file layers can't drift apart.
+    """
+    raw = task_id or "default"
+    return (
+        _task_env_overrides.get(raw)
+        or _task_env_overrides.get(_resolve_container_task_id(raw))
+        or {}
+    )
 
 
 # Configuration from environment variables
 
-def _parse_env_var(name: str, default: str, converter=int, type_label: str = "integer"):
+def _parse_env_var(name: str, default: str, converter: Any = int, type_label: str = "integer"):
     """Parse an environment variable with *converter*, raising a clear error on bad values.
 
     Without this wrapper, a single malformed env var (e.g. TERMINAL_TIMEOUT=5m)
@@ -1141,6 +1153,20 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
         )
 
 
+def _safe_getcwd() -> str:
+    """Return the current working directory, tolerating a deleted CWD.
+
+    ``os.getcwd()`` raises FileNotFoundError when the process's working
+    directory has been removed out from under it (e.g. a scratch workspace
+    that was cleaned up mid-session). Fall back to TERMINAL_CWD, then the
+    user's home directory, so terminal setup never crashes on a stale CWD.
+    """
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1148,16 +1174,40 @@ def _get_env_config() -> Dict[str, Any]:
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
+    container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
+    docker_backend = env_type == "docker"
+
+    # Docker/container-only env vars may be bridged from config.yaml even when
+    # the active backend is local/ssh.  Do not parse their JSON/numeric payloads
+    # until a backend that can consume them is selected; a stale or invalid
+    # Docker value should not make local terminal/execute_code unusable.
+    if container_backend:
+        container_cpu = _parse_env_var("TERMINAL_CONTAINER_CPU", "1", float, "number")
+        container_memory = _parse_env_var("TERMINAL_CONTAINER_MEMORY", "5120")
+        container_disk = _parse_env_var("TERMINAL_CONTAINER_DISK", "51200")
+    else:
+        container_cpu = 1.0
+        container_memory = 5120
+        container_disk = 51200
+
+    if docker_backend:
+        docker_forward_env = _parse_env_var("TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON")
+        docker_volumes = _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON")
+        docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON")
+        docker_extra_args = _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON")
+    else:
+        docker_forward_env = []
+        docker_volumes = []
+        docker_env = {}
+        docker_extra_args = []
 
     # Default cwd: local uses the host's current directory, ssh uses the
-    # remote home, Vercel uses its documented workspace root, and everything
-    # else starts in the backend's default root-like cwd.
+    # remote home, and everything else starts in the backend's default
+    # root-like cwd.
     if env_type == "local":
-        default_cwd = os.getcwd()
+        default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
-    elif env_type == "vercel_sandbox":
-        default_cwd = _VERCEL_SANDBOX_DEFAULT_CWD
     else:
         default_cwd = "/root"
 
@@ -1171,7 +1221,7 @@ def _get_env_config() -> Dict[str, Any]:
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)
@@ -1179,7 +1229,7 @@ def _get_env_config() -> Dict[str, Any]:
         ):
             host_cwd = candidate
             cwd = "/workspace"
-    elif env_type in {"modal", "docker", "singularity", "daytona", "vercel_sandbox"} and cwd:
+    elif env_type in {"modal", "docker", "singularity", "daytona"} and cwd:
         # Host paths and relative paths that won't work inside containers
         is_host_path = any(cwd.startswith(p) for p in host_prefixes)
         is_relative = not os.path.isabs(cwd)  # e.g. "." or "src/"
@@ -1193,11 +1243,10 @@ def _get_env_config() -> Dict[str, Any]:
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
-        "docker_forward_env": _parse_env_var("TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON"),
+        "docker_forward_env": docker_forward_env,
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
-        "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1217,18 +1266,28 @@ def _get_env_config() -> Dict[str, Any]:
         ).lower() in {"true", "1", "yes"},
         "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
-        # daytona, and vercel_sandbox -- ignored for local/ssh)
-        "container_cpu": _parse_env_var("TERMINAL_CONTAINER_CPU", "1", float, "number"),
-        "container_memory": _parse_env_var("TERMINAL_CONTAINER_MEMORY", "5120"),     # MB (default 5GB)
-        "container_disk": _parse_env_var("TERMINAL_CONTAINER_DISK", "51200"),        # MB (default 50GB)
+        # daytona -- ignored for local/ssh)
+        "container_cpu": container_cpu,
+        "container_memory": container_memory,     # MB (default 5GB)
+        "container_disk": container_disk,        # MB (default 50GB)
         "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
-        "docker_volumes": _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON"),
-        "docker_env": _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON"),
+        "docker_volumes": docker_volumes,
+        "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
-        "docker_extra_args": _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON"),
+        "docker_extra_args": docker_extra_args,
+        # Cross-process container reuse (issue #20561).  The docs claim
+        # "ONE long-lived container shared across sessions" — this toggle
+        # makes that real by probing for a labeled container at startup and
+        # attaching to it instead of always starting a fresh one.  Set to
+        # ``false`` for hard per-process isolation (no reuse, container is
+        # removed on exit).
         "docker_persist_across_processes": os.getenv(
             "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
         ).lower() in {"true", "1", "yes"},
+        # Startup orphan reaper for hermes-tagged containers left behind by
+        # crashed / SIGKILL'd previous processes that bypassed atexit.
+        # Conservative: only sweeps Exited containers older than 2× the
+        # idle-reap window AND scoped to the current profile. Issue #20561.
         "docker_orphan_reaper": os.getenv(
             "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
         ).lower() in {"true", "1", "yes"},
@@ -1254,8 +1313,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "vercel_sandbox", "ssh"
-        image: Docker/Singularity/Modal image name (ignored for local/ssh/vercel)
+            "daytona", "ssh"
+        image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
         ssh_config: SSH connection config (for env_type="ssh")
@@ -1282,7 +1341,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     elif env_type == "docker":
         # One-shot orphan reaper: clean up labeled containers left behind by
         # prior Hermes processes that hit SIGKILL / OOM / a closed terminal
-        # before the atexit cleanup hook could run. Gated to once per process.
+        # before the atexit cleanup hook could run.  Gated to once per
+        # process so concurrent _create_environment calls (parallel
+        # subagents, RL benchmarks) don't run the reaper N times.
+        # Disable via ``terminal.docker_orphan_reaper: false`` (issue #20561).
         _maybe_reap_docker_orphans(cc)
         return _DockerEnvironment(
             image=image, cwd=cwd, timeout=timeout,
@@ -1372,21 +1434,6 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
-    elif env_type == "vercel_sandbox":
-        from tools.environments.vercel_sandbox import (
-            VercelSandboxEnvironment as _VercelSandboxEnvironment,
-        )
-        return _VercelSandboxEnvironment(
-            runtime=cc.get("vercel_runtime") or None,
-            cwd=cwd,
-            timeout=timeout,
-            cpu=cpu,
-            memory=memory,
-            disk=disk,
-            persistent_filesystem=persistent,
-            task_id=task_id,
-        )
-
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -1402,7 +1449,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', or 'ssh'"
         )
 
 
@@ -1561,8 +1608,23 @@ def cleanup_all_environments():
 def cleanup_vm(task_id: str, *, force_remove: bool = False):
     """Manually clean up a specific environment by task_id.
 
-    *force_remove* is forwarded to backends that accept it (currently Docker).
-    The default preserves persistent containers across normal session teardown.
+    *force_remove* (default False) is forwarded to backends that accept it
+    — currently only ``DockerEnvironment``. The default of False matches
+    session-lifecycle semantics: this function is called from
+    ``AIAgent.close()`` (TUI session close, gateway session teardown) and the
+    per-turn cleanup branch for non-persistent envs, both of which should
+    honor the user's persist-mode preference. Stopping the container here
+    would defeat the "ONE long-lived container shared across sessions"
+    contract — exactly the bug Ben reported when the container was killed
+    on every TUI session close.
+
+    Pass ``force_remove=True`` for actual user-initiated teardown
+    (e.g. ``/reset``-style flows that haven't been wired yet, or future
+    "destroy my sandbox" commands).
+
+    The idle reaper passes the env through ``env.cleanup()`` directly (not
+    via this function), so persist-mode idle envs are similarly no-op'd —
+    only the orphan reaper at next startup reclaims them.
     """
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
@@ -1588,6 +1650,8 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
 
     try:
         if hasattr(env, 'cleanup'):
+            # Pass force_remove only if the env's cleanup() accepts it
+            # (DockerEnvironment after issue #20561; other backends don't).
             import inspect
             sig = inspect.signature(env.cleanup)
             if "force_remove" in sig.parameters:
@@ -1615,15 +1679,22 @@ def _atexit_cleanup():
     if _active_environments:
         count = len(_active_environments)
         logger.info("Shutting down %d remaining sandbox(es)...", count)
+        # Snapshot the env objects BEFORE cleanup_all_environments empties
+        # the dict; we need them to wait on docker cleanup threads after the
+        # registry has been cleared.
         envs_to_wait = list(_active_environments.values())
         cleanup_all_environments()
+        # Block briefly so docker stop/rm actually completes before the
+        # interpreter exits. Issue #20561 — without this join, the daemon
+        # cleanup threads were getting torn down mid-`docker stop`, leaving
+        # Exited containers piled up on the host.
         for env in envs_to_wait:
             wait_fn = getattr(env, "wait_for_cleanup", None)
             if wait_fn is None:
                 continue
             try:
                 wait_fn(timeout=15.0)
-            except Exception as e:
+            except Exception as e:  # never block shutdown on a bad backend
                 logger.debug("wait_for_cleanup raised on exit: %s", e)
 
 atexit.register(_atexit_cleanup)
@@ -1826,6 +1897,30 @@ def _resolve_notification_flag_conflict(
     return watch_patterns, ""
 
 
+def _resolve_command_cwd(
+    *,
+    workdir: Optional[str],
+    env: Any,
+    default_cwd: str,
+) -> str:
+    """Return the cwd for a command, preferring the live session cwd.
+
+    ``terminal_tool`` historically re-sent the init-time/config cwd on every
+    call. That broke session-local ``cd`` state: the environment tracked the
+    new directory in ``env.cwd``, but foreground/background calls kept forcing
+    the old cwd back through ``env.execute(..., cwd=...)``. Explicit
+    ``workdir=`` must still override everything.
+    """
+    if workdir:
+        return workdir
+
+    live_cwd = getattr(env, "cwd", None)
+    if isinstance(live_cwd, str) and live_cwd.strip():
+        return live_cwd
+
+    return default_cwd
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -1891,8 +1986,12 @@ def terminal_tool(
         effective_task_id = _resolve_container_task_id(task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
-        # before falling back to global env var config
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        # before falling back to global env var config. ``resolve_task_overrides``
+        # reads the raw task id first then the collapsed container id, so a
+        # CWD-only override (which collapses ``effective_task_id`` to
+        # ``"default"``) is still found under its originating session id while
+        # isolation-keyed RL/benchmark overrides keep resolving as before.
+        overrides = resolve_task_overrides(task_id)
         
         # Select image based on env type, with per-task override support
         if env_type == "docker":
@@ -1940,10 +2039,20 @@ def terminal_tool(
         # Use a per-task creation lock so concurrent tool calls for the same
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
+        env = None
         with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                env = _active_environments[effective_task_id]
+            # Prefer the collapsed container id, but fall back to an env cached
+            # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
+            # with a CWD-only override collapse to "default" for container
+            # sharing, yet an env may already be cached under the originating
+            # task_id; honor it instead of spawning a duplicate.
+            _existing_key = (
+                effective_task_id if effective_task_id in _active_environments
+                else (task_id if task_id and task_id in _active_environments else None)
+            )
+            if _existing_key is not None:
+                _last_activity[_existing_key] = time.time()
+                env = _active_environments[_existing_key]
                 needs_creation = False
             else:
                 needs_creation = True
@@ -1958,9 +2067,13 @@ def terminal_tool(
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
-                    if effective_task_id in _active_environments:
-                        _last_activity[effective_task_id] = time.time()
-                        env = _active_environments[effective_task_id]
+                    _existing_key = (
+                        effective_task_id if effective_task_id in _active_environments
+                        else (task_id if task_id and task_id in _active_environments else None)
+                    )
+                    if _existing_key is not None:
+                        _last_activity[_existing_key] = time.time()
+                        env = _active_environments[_existing_key]
                         needs_creation = False
 
                 if needs_creation:
@@ -1979,14 +2092,13 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+                        if env_type in {"docker", "singularity", "modal", "daytona"}:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
                                 "container_disk": config.get("container_disk", 51200),
                                 "container_persistent": config.get("container_persistent", True),
                                 "modal_mode": config.get("modal_mode", "auto"),
-                                "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                                 "docker_forward_env": config.get("docker_forward_env", []),
@@ -2028,8 +2140,16 @@ def terminal_tool(
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
-        # Validate workdir before approval so smart-approval context never
-        # inspects a shell-metacharacter-bearing path.
+        if env is None:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "Terminal environment is unavailable",
+                "status": "error",
+            }, ensure_ascii=False)
+
+        # Validate workdir before approval context is built so the approval
+        # judge sees the actual execution location, not an unchecked input.
         if workdir:
             workdir_error = _validate_workdir(workdir)
             if workdir_error:
@@ -2042,16 +2162,18 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
+        approval_context_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            env=env,
+            default_cwd=cwd,
+        )
+        _set_approval_context_cwd(approval_context_cwd)
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
         if not force:
-            _set_approval_context_cwd(workdir or cwd)
-            try:
-                approval = _check_all_guards(command, env_type)
-            finally:
-                _set_approval_context_cwd(None)
-            approval_note = _format_approval_note(approval)
+            approval = _check_all_guards(command, env_type)
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
@@ -2064,7 +2186,6 @@ def terminal_tool(
                         "command": approval.get("command", command),
                         "description": approval.get("description", "command flagged"),
                         "pattern_key": approval.get("pattern_key", ""),
-                        **({"approval": approval_note} if approval_note else {}),
                     }, ensure_ascii=False)
                 # Command was blocked
                 desc = approval.get("description", "command flagged")
@@ -2072,13 +2193,17 @@ def terminal_tool(
                     f"Command denied: {desc}. "
                     "Use the approval prompt to allow it, or rephrase the command."
                 )
-                return json.dumps({
+                blocked_result = {
                     "output": "",
                     "exit_code": -1,
                     "error": approval.get("message", fallback_msg),
-                    "status": "blocked",
-                    **({"approval": approval_note} if approval_note else {}),
-                }, ensure_ascii=False)
+                    "status": "blocked"
+                }
+                blocked_note = _format_approval_note(approval)
+                if blocked_note:
+                    blocked_result["approval"] = blocked_note
+                return json.dumps(blocked_result, ensure_ascii=False)
+            approval_note = _format_approval_note(approval)
 
         # Prepare command for execution
         pty_disabled_reason = None
@@ -2100,7 +2225,11 @@ def terminal_tool(
             from tools.process_registry import process_registry
 
             session_key = get_current_session_key(default="")
-            effective_cwd = workdir or cwd
+            effective_cwd = _resolve_command_cwd(
+                workdir=workdir,
+                env=env,
+                default_cwd=cwd,
+            )
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2133,9 +2262,17 @@ def terminal_tool(
                     result_data["pty_note"] = pty_disabled_reason
 
                 # Nudge: background=True without notify_on_complete=True OR
-                # watch_patterns is a silent process. Bounded tasks (tests,
-                # builds, deploys, CI pollers) should almost always opt in to
-                # completion notification so the agent does not forget to poll.
+                # watch_patterns is a silent process. The agent has NO way to
+                # learn it finished short of calling process(action="poll"/"wait")
+                # explicitly. That's correct only for genuine long-lived
+                # processes that never exit (servers, watchers). For every
+                # bounded task (tests, builds, CI pollers, deploys, batch
+                # jobs) the agent almost certainly wanted notification and
+                # forgot the flag. May 2026 PR #31231 incident: bg CI poller
+                # ran fine, exited green, agent never noticed — user had to
+                # surface the result. Cheap nudge here costs ~one read for
+                # server cases (false positive) and prevents silent
+                # blindness for bounded-task cases (false negative).
                 if background and not notify_on_complete and not watch_patterns:
                     result_data["hint"] = (
                         "background=true without notify_on_complete=true means "
@@ -2150,22 +2287,79 @@ def terminal_tool(
                         "that never exit (servers, watchers, daemons)."
                     )
 
+                # Nudge: homebrewed CI watcher built from `gh pr view`
+                # `--json statusCheckRollup` or `gh pr checks` piped through
+                # `jq` is the #1 cause of silent CI-watcher failures in
+                # hermes-agent dev work. May 2026 PRs that surfaced this
+                # exact failure mode: #31329, #31448, #31695, #31709, #31745,
+                # #32264, #33131. Failure modes seen:
+                #   * `gh pr view --json statusCheckRollup --jq ...` with
+                #     `from_entries` choking on null `conclusion` keys, loop
+                #     silently exits with empty status, never terminates.
+                #   * `for i in $(seq 1 60); do ... 2>&1` block-buffered stdout
+                #     never flushed to background-process capture; SIGTERM
+                #     cuts the buffer before flush; `process(action='log')`
+                #     returns total_lines=0 forever.
+                #   * conclusion vs. status field confusion: filtering for
+                #     `PENDING` in `.conclusion` while in-progress checks have
+                #     empty conclusion → poller declares all-green while 18/23
+                #     checks still IN_PROGRESS.
+                #   * grepping for TTY-only banners ("All checks were
+                #     successful") that never appear when stdout is piped.
+                # The canonical patterns in the green-ci-policy skill avoid
+                # every one of these — drive the loop off exit codes or on
+                # tab-separated `awk -F"\t" "$2==\"pending\""` (column 2).
+                # The detector here is deliberately narrow: it flags the
+                # statusCheckRollup JSON-API path and the `gh pr checks` +
+                # jq combination, but NOT the canonical column-2 awk
+                # poller (which uses awk on tabs, not as a generic
+                # stdout parser). When we detect the homebrew shape, point
+                # the agent at the canonical snippet rather than letting
+                # it ship another broken poller.
                 if background and command:
                     _gh = ("gh pr view" in command or "gh pr checks" in command)
                     _has_jq = (
                         " jq " in command or "| jq" in command or "$(jq" in command
                     )
-                    _bad_shape = "statusCheckRollup" in command or (_gh and _has_jq)
+                    _bad_shape = (
+                        # The JSON-API anti-pattern. Even without jq, going
+                        # through `--json statusCheckRollup` + parsing puts
+                        # you in conclusion-vs-status field hell.
+                        "statusCheckRollup" in command
+                        # gh pr checks piped to jq is also wrong — `gh pr
+                        # checks` doesn't emit JSON, so any `| jq` here is
+                        # confused intent. The canonical column-2 poller
+                        # uses awk-on-tabs, not jq.
+                        or (_gh and _has_jq)
+                    )
                     if _bad_shape:
                         existing = result_data.get("hint", "")
                         canonical_hint = (
                             "This looks like a homebrewed CI poller built from "
                             "`gh pr view --json statusCheckRollup` and/or "
-                            "`gh pr checks | jq`. Use the canonical snippets in "
-                            "the green-ci-policy skill instead: drive `gh pr "
-                            "checks` from exit codes, or use a tab-separated "
-                            "column-2 pending check with awk; avoid jq/null "
-                            "conclusion parsing and buffered background stdout loops."
+                            "`gh pr checks | jq`. That shape has burned us "
+                            "repeatedly in hermes-agent dev work (PRs #31329, "
+                            "#31448, #31695, #31709, #31745, #32264, #33131) — "
+                            "stdout buffering kills output capture, jq null-key "
+                            "edge cases silently exit the loop, conclusion-vs-"
+                            "status field confusion exits early with bogus "
+                            "all-green verdicts, TTY-only summary banners "
+                            "never appear when piped. Use the canonical "
+                            "snippets in the green-ci-policy skill instead: "
+                            "the exit-code-driven `gh pr checks $PR >/dev/null` "
+                            "(rc 0 = green, 8 = pending, else fail) for "
+                            "exit-on-first-fail behavior, or the column-2 "
+                            "awk-on-tabs poller "
+                            "(`awk -F\"\\t\" \"$2==\\\"pending\\\"\"`) for "
+                            "sharded matrices. Load skill_view("
+                            "name='github/hermes-agent-dev', "
+                            "file_path='references/green-ci-policy.md') for "
+                            "the verbatim snippets. If you must roll a custom "
+                            "loop with rich structured output, write each tick "
+                            "to a known file (`tee -a /tmp/ci.log`) and rely "
+                            "on `process(action='log')` to read THAT file — "
+                            "do not rely on background-process stdout capture "
+                            "for line-buffered shell loops."
                         )
                         result_data["hint"] = (
                             existing + "\n\n" + canonical_hint if existing
@@ -2252,7 +2446,11 @@ def terminal_tool(
                 try:
                     execute_kwargs = {
                         "timeout": effective_timeout,
-                        "cwd": workdir or cwd,
+                        "cwd": _resolve_command_cwd(
+                            workdir=workdir,
+                            env=env,
+                            default_cwd=cwd,
+                        ),
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
@@ -2378,13 +2576,13 @@ def check_terminal_requirements() -> bool:
             if not docker:
                 logger.error("Docker executable not found in PATH or common install locations")
                 return False
-            result = subprocess.run([docker, "version"], capture_output=True, timeout=5)
+            result = subprocess.run([docker, "version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
             return result.returncode == 0
 
         elif env_type == "singularity":
             executable = shutil.which("apptainer") or shutil.which("singularity")
             if executable:
-                result = subprocess.run([executable, "--version"], capture_output=True, timeout=5)
+                result = subprocess.run([executable, "--version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
                 return result.returncode == 0
             return False
 
@@ -2457,9 +2655,6 @@ def check_terminal_requirements() -> bool:
 
             return True
 
-        elif env_type == "vercel_sandbox":
-            return _check_vercel_sandbox_requirements(config)
-
         elif env_type == "daytona":
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
@@ -2467,7 +2662,7 @@ def check_terminal_requirements() -> bool:
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, vercel_sandbox, ssh.",
+                "modal, daytona, ssh.",
                 env_type,
             )
             return False
@@ -2510,13 +2705,13 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/vercel_sandbox/ssh)"
+        "(local/docker/singularity/modal/daytona/ssh)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
     print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
-    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', os.getcwd())}")
+    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', _safe_getcwd())}")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
     print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '60')}")
