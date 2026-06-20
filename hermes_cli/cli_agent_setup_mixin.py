@@ -223,6 +223,7 @@ class CLIAgentSetupMixin:
         Returns:
             bool: True if successful, False otherwise
         """
+        import cli as _cli
         from cli import AIAgent, ChatConsole, _DIM, _RST, _accent_hex, _cprint, _prepare_deferred_agent_startup, logger
         if self.agent is not None:
             return True
@@ -392,8 +393,7 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
             )
             # Store reference for atexit memory provider shutdown
-            global _active_agent_ref
-            _active_agent_ref = self.agent
+            _cli._active_agent_ref = self.agent
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint
