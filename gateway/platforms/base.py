@@ -1743,6 +1743,9 @@ class SendResult:
     # stream consumer can send the missing tail instead of marking a clipped
     # response complete.
     retryable: bool = False  # True for transient connection errors — base will retry automatically
+    # Server-requested retry delay in seconds (e.g. Telegram FloodWait retry_after).
+    # When present, _send_with_retry() honors this instead of its default backoff.
+    retry_after: Optional[float] = None
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
     # ``message_id`` is the LAST visible message id (so subsequent edits target
@@ -3760,9 +3763,16 @@ class BasePlatformAdapter(ABC):
             return result
 
         if is_network:
-            # Retry with exponential backoff for transient errors
+            # Retry with exponential backoff for transient errors.
+            # Honor server-requested retry_after (e.g. Telegram FloodWait)
+            # when present — it is authoritative over our backoff schedule.
+            server_retry_after = result.retry_after
             for attempt in range(1, max_retries + 1):
-                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                if server_retry_after is not None:
+                    delay = server_retry_after + random.uniform(0, 1)
+                    server_retry_after = None  # only honor once per send
+                else:
+                    delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     self.name, attempt, max_retries, delay, error_str,
@@ -3778,6 +3788,8 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
+                if result.retry_after is not None:
+                    server_retry_after = result.retry_after
                 if not (result.retryable or self._is_retryable_error(error_str)):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
@@ -4976,8 +4988,27 @@ class BasePlatformAdapter(ABC):
                 # same session.
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
-                    del self._session_tasks[session_key]
-                    self._release_session_guard(session_key, guard=interrupt_event)
+                    self._cleanup_finished_session_task(session_key, interrupt_event)
+
+    def _cleanup_finished_session_task(
+        self, session_key: str, interrupt_event: Optional[asyncio.Event]
+    ) -> None:
+        """Release the session guard for a finished owner task, then drop its
+        ``_session_tasks`` entry ONLY if the guard was actually released.
+
+        Release-then-conditional-delete is the #48300 fix: when a concurrent
+        path (reset/new command, drain handoff) swapped ``_active_sessions[key]``
+        to a different guard, ``_release_session_guard`` skips on the guard
+        mismatch and the lock stays installed. If we deleted ``_session_tasks``
+        unconditionally (the old order), ``_session_task_is_stale`` would later
+        see no owner task and report "not stale", so the orphaned guard would
+        never be healed — a permanent session deadlock. Keeping the done-task
+        entry when the guard survives lets the on-entry self-heal detect the
+        stale lock and clear it on the next inbound message.
+        """
+        self._release_session_guard(session_key, guard=interrupt_event)
+        if session_key not in self._active_sessions:
+            self._session_tasks.pop(session_key, None)
     
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.

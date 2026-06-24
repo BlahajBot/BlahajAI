@@ -44,6 +44,27 @@ from utils import (
 logger = logging.getLogger("gateway.run")
 
 
+_RESET_CLEANUP_TIMEOUT_S = 30.0
+
+
+def _model_switch_skew_guard() -> Optional[str]:
+    """Refuse model switches when the gateway process is stale vs disk."""
+    from gateway.code_skew import detect_code_skew
+
+    skew = detect_code_skew()
+    if not skew:
+        return None
+    boot_rev, disk_rev = skew
+    return t(
+        "gateway.model.error_prefix",
+        error=(
+            f"This gateway is running code from {boot_rev} but the checkout on "
+            f"disk is now {disk_rev}. Switching models would risk a stale-module "
+            f"crash — restart the gateway to load the new code: hermes gateway restart"
+        ),
+    )
+
+
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
@@ -74,7 +95,24 @@ class GatewaySlashCommandsMixin:
                 _cached = self._agent_cache.get(session_key)
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
             if _old_agent is not None:
-                self._cleanup_agent_resources(_old_agent)
+                try:
+                    await asyncio.wait_for(
+                        self._run_in_executor_with_context(
+                            self._cleanup_agent_resources, _old_agent
+                        ),
+                        timeout=_RESET_CLEANUP_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Agent resource cleanup for session %s exceeded %ss during "
+                        "/new reset; proceeding with reset (#35994)",
+                        session_key, _RESET_CLEANUP_TIMEOUT_S,
+                    )
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Agent resource cleanup for session %s failed during /new reset: %s (#35994)",
+                        session_key, cleanup_exc,
+                    )
         self._evict_cached_agent(session_key)
 
         # Discard any /queue overflow for this session — /new is a
@@ -886,6 +924,7 @@ class GatewaySlashCommandsMixin:
         import yaml
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
+            resolve_persist_behavior,
             list_authenticated_providers,
             list_picker_providers,
         )
@@ -893,8 +932,9 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
 
-        # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+        # Parse --provider, --global, --session, and --refresh flags
+        model_input, explicit_provider, is_global, force_refresh, is_session = parse_model_flags(raw_args)
+        persist_global = resolve_persist_behavior(is_global, is_session)
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -955,7 +995,8 @@ class GatewaySlashCommandsMixin:
 
             if has_picker:
                 try:
-                    providers = list_picker_providers(
+                    providers = await asyncio.to_thread(
+                        list_picker_providers,
                         current_provider=current_provider,
                         current_base_url=current_base_url,
                         current_model=current_model,
@@ -980,6 +1021,9 @@ class GatewaySlashCommandsMixin:
                         _chat_id: str, model_id: str, provider_slug: str
                     ) -> str:
                         """Perform the model switch and return confirmation text."""
+                        skew_error = _model_switch_skew_guard()
+                        if skew_error:
+                            return skew_error
                         result = _switch_model(
                             raw_input=model_id,
                             current_provider=_cur_provider,
@@ -1021,6 +1065,8 @@ class GatewaySlashCommandsMixin:
                                 _sess_entry = _self.session_store.get_or_create_session(
                                     event.source
                                 )
+                                if getattr(_sess_entry, "was_auto_reset", False):
+                                    _sess_entry.was_auto_reset = False
                                 _sess_db.update_session_model(
                                     _sess_entry.session_id, result.new_model
                                 )
@@ -1104,7 +1150,8 @@ class GatewaySlashCommandsMixin:
             lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
 
             try:
-                providers = list_authenticated_providers(
+                providers = await asyncio.to_thread(
+                    list_authenticated_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
                     current_model=current_model,
@@ -1131,6 +1178,9 @@ class GatewaySlashCommandsMixin:
             return "\n".join(lines)
 
         # Perform the switch
+        skew_error = _model_switch_skew_guard()
+        if skew_error:
+            return skew_error
         result = _switch_model(
             raw_input=model_input,
             current_provider=current_provider,
@@ -1172,6 +1222,8 @@ class GatewaySlashCommandsMixin:
         if _sess_db is not None:
             try:
                 _sess_entry = self.session_store.get_or_create_session(source)
+                if getattr(_sess_entry, "was_auto_reset", False):
+                    _sess_entry.was_auto_reset = False
                 _sess_db.update_session_model(
                     _sess_entry.session_id, result.new_model
                 )

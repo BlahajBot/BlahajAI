@@ -1441,6 +1441,7 @@ from gateway.platforms.base import (
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
@@ -2082,6 +2083,17 @@ def _normalize_empty_agent_response(
         return (
             "⚠️ Processing completed but no response was generated. "
             "This may be a transient error — try sending your message again."
+        )
+
+    if (
+        api_calls == 0
+        and not agent_result.get("interrupted")
+        and not agent_result.get("failed")
+        and not agent_result.get("partial")
+    ):
+        return (
+            "⚠️ Your message wasn't processed (the previous turn was still "
+            "being cleaned up). Please send it again."
         )
 
     return response
@@ -8422,7 +8434,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._record_telegram_topic_binding(source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
-        if getattr(session_entry, "was_auto_reset", False):
+        _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
+        if _was_auto_reset:
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not
             # inherit the previous conversation's model/reasoning overrides
@@ -8431,11 +8444,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
+            session_entry.was_auto_reset = False
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
             session_entry.created_at == session_entry.updated_at
-            or getattr(session_entry, "was_auto_reset", False)
+            or _was_auto_reset
             or getattr(session_entry, "is_fresh_reset", False)
         )
         # Consume the is_fresh_reset flag immediately so it doesn't leak
@@ -8469,7 +8483,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
-        if getattr(session_entry, 'was_auto_reset', False):
+        if _was_auto_reset:
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
