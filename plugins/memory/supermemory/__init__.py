@@ -28,7 +28,9 @@ _DEFAULT_PROFILE_FREQUENCY = 50
 _DEFAULT_CAPTURE_MODE = "all"
 _DEFAULT_SEARCH_MODE = "hybrid"
 _VALID_SEARCH_MODES = ("hybrid", "memories", "documents")
+_DEFAULT_MIN_RECALL_SIMILARITY = 0.70
 _DEFAULT_API_TIMEOUT = 5.0
+_DEFAULT_API_MAX_RETRIES = 2
 _MIN_CAPTURE_LENGTH = 10
 _MAX_ENTITY_CONTEXT_LENGTH = 1500
 _CONVERSATIONS_URL = "https://api.supermemory.ai/v4/conversations"
@@ -60,11 +62,13 @@ def _default_config() -> dict:
         "auto_recall": True,
         "auto_capture": True,
         "max_recall_results": _DEFAULT_MAX_RECALL_RESULTS,
+        "min_recall_similarity": _DEFAULT_MIN_RECALL_SIMILARITY,
         "profile_frequency": _DEFAULT_PROFILE_FREQUENCY,
         "capture_mode": _DEFAULT_CAPTURE_MODE,
         "search_mode": _DEFAULT_SEARCH_MODE,
         "entity_context": _DEFAULT_ENTITY_CONTEXT,
         "api_timeout": _DEFAULT_API_TIMEOUT,
+        "api_max_retries": _DEFAULT_API_MAX_RETRIES,
         "enable_custom_container_tags": False,
         "custom_containers": [],
         "custom_container_instructions": "",
@@ -118,6 +122,10 @@ def _load_supermemory_config(hermes_home: str) -> dict:
     except Exception:
         config["max_recall_results"] = _DEFAULT_MAX_RECALL_RESULTS
     try:
+        config["min_recall_similarity"] = max(0.0, min(1.0, float(config.get("min_recall_similarity", _DEFAULT_MIN_RECALL_SIMILARITY))))
+    except Exception:
+        config["min_recall_similarity"] = _DEFAULT_MIN_RECALL_SIMILARITY
+    try:
         config["profile_frequency"] = max(1, min(500, int(config.get("profile_frequency", _DEFAULT_PROFILE_FREQUENCY))))
     except Exception:
         config["profile_frequency"] = _DEFAULT_PROFILE_FREQUENCY
@@ -129,6 +137,10 @@ def _load_supermemory_config(hermes_home: str) -> dict:
         config["api_timeout"] = max(0.5, min(15.0, float(config.get("api_timeout", _DEFAULT_API_TIMEOUT))))
     except Exception:
         config["api_timeout"] = _DEFAULT_API_TIMEOUT
+    try:
+        config["api_max_retries"] = max(0, min(5, int(config.get("api_max_retries", _DEFAULT_API_MAX_RETRIES))))
+    except Exception:
+        config["api_max_retries"] = _DEFAULT_API_MAX_RETRIES
 
     # Multi-container support
     config["enable_custom_container_tags"] = _as_bool(config.get("enable_custom_container_tags"), False)
@@ -207,11 +219,22 @@ def _deduplicate_recall(static_facts: list, dynamic_facts: list, search_results:
     return out_static, out_dynamic, out_search
 
 
-def _format_prefetch_context(static_facts: list, dynamic_facts: list, search_results: list, max_results: int) -> str:
+def _format_prefetch_context(static_facts: list, dynamic_facts: list, search_results: list,
+                             max_results: int, min_similarity: float = 0.0) -> str:
     statics, dynamics, search = _deduplicate_recall(static_facts, dynamic_facts, search_results)
     statics = statics[:max_results]
     dynamics = dynamics[:max_results]
-    search = search[:max_results]
+    filtered_search = []
+    for item in search:
+        similarity = item.get("similarity")
+        if similarity is not None:
+            try:
+                if float(similarity) < min_similarity:
+                    continue
+            except Exception:
+                pass
+        filtered_search.append(item)
+    search = filtered_search[:max_results]
     if not statics and not dynamics and not search:
         return ""
 
@@ -223,7 +246,7 @@ def _format_prefetch_context(static_facts: list, dynamic_facts: list, search_res
     if search:
         lines = []
         for item in search:
-            memory = item.get("memory", "")
+            memory = item.get("memory", "") or item.get("chunk", "")
             if not memory:
                 continue
             similarity = item.get("similarity")
@@ -263,7 +286,8 @@ def _is_trivial_message(text: str) -> bool:
 
 
 class _SupermemoryClient:
-    def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid"):
+    def __init__(self, api_key: str, timeout: float, container_tag: str,
+                 search_mode: str = "hybrid", max_retries: int = _DEFAULT_API_MAX_RETRIES):
         # Lazy-install the supermemory SDK on demand. ensure() honors
         # security.allow_lazy_installs (default true) and, on a sealed Docker
         # venv, redirects the install to the durable target. On failure we
@@ -286,7 +310,7 @@ class _SupermemoryClient:
         self._client = Supermemory(
             api_key=api_key,
             timeout=timeout,
-            max_retries=0,
+            max_retries=max_retries,
             default_headers={"x-sm-source": "hermes"},
         )
 
@@ -330,7 +354,8 @@ class _SupermemoryClient:
         for item in (getattr(response, "results", None) or []):
             results.append({
                 "id": getattr(item, "id", ""),
-                "memory": getattr(item, "memory", "") or "",
+                "memory": getattr(item, "memory", None) or getattr(item, "chunk", None) or "",
+                "chunk": getattr(item, "chunk", None),
                 "similarity": getattr(item, "similarity", None),
                 "updated_at": getattr(item, "updated_at", None) or getattr(item, "updatedAt", None),
                 "metadata": getattr(item, "metadata", None),
@@ -356,7 +381,8 @@ class _SupermemoryClient:
                     search_results.append(item)
                 else:
                     search_results.append({
-                        "memory": getattr(item, "memory", ""),
+                        "memory": getattr(item, "memory", "") or getattr(item, "chunk", "") or "",
+                        "chunk": getattr(item, "chunk", None),
                         "updated_at": getattr(item, "updated_at", None) or getattr(item, "updatedAt", None),
                         "similarity": getattr(item, "similarity", None),
                     })
@@ -526,11 +552,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._auto_recall = True
         self._auto_capture = True
         self._max_recall_results = _DEFAULT_MAX_RECALL_RESULTS
+        self._min_recall_similarity = _DEFAULT_MIN_RECALL_SIMILARITY
         self._profile_frequency = _DEFAULT_PROFILE_FREQUENCY
         self._capture_mode = _DEFAULT_CAPTURE_MODE
         self._search_mode = _DEFAULT_SEARCH_MODE
         self._entity_context = _DEFAULT_ENTITY_CONTEXT
         self._api_timeout = _DEFAULT_API_TIMEOUT
+        self._api_max_retries = _DEFAULT_API_MAX_RETRIES
         self._hermes_home = ""
         self._write_enabled = True
         self._active = False
@@ -640,11 +668,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._auto_recall = self._config["auto_recall"]
         self._auto_capture = self._config["auto_capture"]
         self._max_recall_results = self._config["max_recall_results"]
+        self._min_recall_similarity = self._config["min_recall_similarity"]
         self._profile_frequency = self._config["profile_frequency"]
         self._capture_mode = self._config["capture_mode"]
         self._search_mode = self._config["search_mode"]
         self._entity_context = self._config["entity_context"]
         self._api_timeout = self._config["api_timeout"]
+        self._api_max_retries = self._config["api_max_retries"]
         self._enable_custom_containers = self._config["enable_custom_container_tags"]
         self._custom_containers = self._config["custom_containers"]
         self._custom_container_instructions = self._config["custom_container_instructions"]
@@ -663,6 +693,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     timeout=self._api_timeout,
                     container_tag=self._container_tag,
                     search_mode=self._search_mode,
+                    max_retries=self._api_max_retries,
                 )
             except Exception:
                 logger.warning("Supermemory initialization failed", exc_info=True)
@@ -699,6 +730,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 dynamic_facts=profile["dynamic"] if include_profile else [],
                 search_results=profile["search_results"],
                 max_results=self._max_recall_results,
+                min_similarity=self._min_recall_similarity,
             )
             return context
         except Exception:
