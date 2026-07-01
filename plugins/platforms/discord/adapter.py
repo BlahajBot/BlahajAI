@@ -746,9 +746,10 @@ class DiscordAdapter(BasePlatformAdapter):
     - Reaction-based feedback
     """
 
-    # Discord message limits
+    # Discord message/upload limits
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
+    DEFAULT_UPLOAD_LIMIT_BYTES = 25 * 1024 * 1024
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
@@ -833,6 +834,67 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent set of bot-authored lifecycle/status message IDs that
         # should not act as conversational history boundaries after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
+
+    @staticmethod
+    def _format_bytes(num_bytes: int) -> str:
+        value = float(max(0, int(num_bytes)))
+        for unit in ("bytes", "KB", "MB", "GB"):
+            if value < 1024 or unit == "GB":
+                if unit == "bytes":
+                    return f"{int(value)} bytes"
+                return f"{value:.1f} {unit}"
+            value /= 1024.0
+        return f"{value:.1f} GB"
+
+    def _discord_upload_limit_bytes(self, channel: Any = None) -> int:
+        guild = getattr(channel, "guild", None)
+        guild_limit = getattr(guild, "filesize_limit", None)
+        if isinstance(guild_limit, (int, float)) and int(guild_limit) > 0:
+            return int(guild_limit)
+
+        configured = self.config.extra.get("upload_limit_bytes")
+        if configured is None:
+            configured = os.getenv("DISCORD_UPLOAD_LIMIT_BYTES")
+        if configured is None:
+            configured_mb = self.config.extra.get("upload_limit_mb")
+            if configured_mb is None:
+                configured_mb = os.getenv("DISCORD_UPLOAD_LIMIT_MB")
+            if configured_mb is not None:
+                try:
+                    return int(float(configured_mb) * 1024 * 1024)
+                except (TypeError, ValueError):
+                    pass
+        else:
+            try:
+                return int(configured)
+            except (TypeError, ValueError):
+                pass
+        return self.DEFAULT_UPLOAD_LIMIT_BYTES
+
+    def _discord_attachment_size_result(
+        self,
+        *,
+        filename: str,
+        size_bytes: int,
+        limit_bytes: int,
+    ) -> Optional[SendResult]:
+        if int(size_bytes) <= int(limit_bytes):
+            return None
+        return SendResult(
+            success=False,
+            error=(
+                "Discord upload too large: "
+                f"{filename} is {self._format_bytes(size_bytes)}; "
+                f"limit is {self._format_bytes(limit_bytes)}. "
+                "The file was not attached."
+            ),
+            raw_response={
+                "file_too_large": True,
+                "filename": filename,
+                "size_bytes": int(size_bytes),
+                "limit_bytes": int(limit_bytes),
+            },
+        )
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Surface post-startup discord.py task exits to the gateway supervisor.
@@ -2315,6 +2377,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Channel {chat_id} not found")
 
         filename = file_name or os.path.basename(file_path)
+        size_result = self._discord_attachment_size_result(
+            filename=filename,
+            size_bytes=os.path.getsize(file_path),
+            limit_bytes=self._discord_upload_limit_bytes(channel),
+        )
+        if size_result is not None:
+            return size_result
+
         with open(file_path, "rb") as fh:
             file = discord.File(fh, filename=filename)
             if self._is_forum_parent(channel):
