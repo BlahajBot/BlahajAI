@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import Dict, FrozenSet, Optional
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,25 @@ class UpstreamCredential:
     """ISO-8601 expiry timestamp for the bearer, when known. Informational."""
 
 
+@dataclass(frozen=True)
+class PreparedRequest:
+    """Provider-adjusted request ready to send upstream.
+
+    Most providers use the default pass-through implementation. Adapters for
+    subscription backends with non-public API quirks can override
+    :meth:`UpstreamAdapter.prepare_request` to add required query parameters,
+    remove unsupported body fields, or set provider-specific headers while the
+    proxy server remains provider-agnostic.
+    """
+
+    method: str
+    rel_path: str
+    query_string: str
+    headers: Dict[str, str]
+    body: bytes
+
 class UpstreamAdapter(ABC):
+
     """Contract for an upstream provider the proxy can forward to."""
 
     @property
@@ -95,6 +113,29 @@ class UpstreamAdapter(ABC):
         _ = failed_credential, status_code
         return None
 
+    def prepare_request(
+        self,
+        *,
+        method: str,
+        rel_path: str,
+        query_string: str,
+        headers: Dict[str, str],
+        body: bytes,
+    ) -> PreparedRequest:
+        """Return the upstream request after adapter-specific adjustments.
+
+        The default preserves the historical proxy behavior exactly: method,
+        path, query string, headers, and body pass through unchanged except for
+        the server replacing Authorization after this hook returns.
+        """
+        return PreparedRequest(
+            method=method,
+            rel_path=rel_path,
+            query_string=query_string,
+            headers=dict(headers),
+            body=body,
+        )
+
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""
         try:
@@ -105,4 +146,4 @@ class UpstreamAdapter(ABC):
         return f"{self.display_name}: {cred.base_url}{ttl}"
 
 
-__all__ = ["UpstreamAdapter", "UpstreamCredential"]
+__all__ = ["PreparedRequest", "UpstreamAdapter", "UpstreamCredential"]

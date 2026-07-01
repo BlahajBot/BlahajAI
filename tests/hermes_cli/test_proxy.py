@@ -12,7 +12,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
-from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+from hermes_cli.proxy.adapters.base import PreparedRequest, UpstreamAdapter, UpstreamCredential
+from hermes_cli.proxy.adapters.codex import CodexAdapter
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
@@ -30,6 +31,10 @@ def test_registry_lists_xai():
     assert "xai" in ADAPTERS
 
 
+def test_registry_lists_codex():
+    assert "codex" in ADAPTERS
+
+
 def test_get_adapter_returns_instance():
     adapter = get_adapter("nous")
     assert isinstance(adapter, NousPortalAdapter)
@@ -42,10 +47,17 @@ def test_get_adapter_returns_xai_instance():
     assert isinstance(adapter, UpstreamAdapter)
 
 
+def test_get_adapter_returns_codex_instance():
+    adapter = get_adapter("codex")
+    assert isinstance(adapter, CodexAdapter)
+    assert isinstance(adapter, UpstreamAdapter)
+
+
 def test_get_adapter_case_insensitive():
     assert isinstance(get_adapter("NOUS"), NousPortalAdapter)
     assert isinstance(get_adapter("  Nous  "), NousPortalAdapter)
     assert isinstance(get_adapter("XAI"), XAIGrokAdapter)
+    assert isinstance(get_adapter("CODEX"), CodexAdapter)
 
 
 def test_get_adapter_unknown_provider_raises():
@@ -565,6 +577,184 @@ def test_xai_adapter_retry_returns_none_for_unrelated_status(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# CodexAdapter
+# ---------------------------------------------------------------------------
+
+
+def _write_codex_auth_store(
+    hermes_home: Path,
+    *,
+    access_token: str = "codex-access-token",
+    refresh_token: str = "codex-refresh-token",
+) -> Path:
+    auth_path = hermes_home / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                },
+                "last_refresh": "2026-06-01T00:00:00Z",
+                "auth_mode": "chatgpt",
+            },
+        },
+    }))
+    return auth_path
+
+
+def test_codex_adapter_metadata():
+    adapter = CodexAdapter()
+    assert adapter.name == "codex"
+    assert adapter.display_name == "OpenAI Codex"
+    assert "/responses" in adapter.allowed_paths
+    assert "/models" in adapter.allowed_paths
+    assert "/chat/completions" not in adapter.allowed_paths
+
+
+def test_codex_adapter_not_authenticated_when_no_auth_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = CodexAdapter()
+    assert not adapter.is_authenticated()
+
+
+def test_codex_adapter_authenticated_with_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_auth_store(tmp_path)
+    assert CodexAdapter().is_authenticated()
+
+
+def test_codex_adapter_get_credential_uses_runtime_resolver(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.codex.resolve_codex_runtime_credentials",
+        lambda **kwargs: {
+            "api_key": "fresh-codex-token",
+            "base_url": "https://chatgpt.com/backend-api/codex/",
+            "last_refresh": "2026-06-01T00:00:00Z",
+        },
+    )
+
+    cred = CodexAdapter().get_credential()
+
+    assert cred.bearer == "fresh-codex-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    assert cred.token_type == "Bearer"
+
+
+def test_codex_adapter_retry_force_refreshes_on_401(monkeypatch):
+    calls = []
+
+    def fake_resolve(**kwargs):
+        calls.append(kwargs)
+        return {
+            "api_key": "fresh-codex-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.codex.resolve_codex_runtime_credentials",
+        fake_resolve,
+    )
+
+    retry = CodexAdapter().get_retry_credential(
+        failed_credential=UpstreamCredential(
+            bearer="stale-token",
+            base_url="https://chatgpt.com/backend-api/codex",
+        ),
+        status_code=401,
+    )
+
+    assert retry is not None
+    assert retry.bearer == "fresh-codex-token"
+    assert calls[-1]["force_refresh"] is True
+
+
+def test_codex_prepare_models_adds_required_client_version():
+    prepared = CodexAdapter().prepare_request(
+        method="GET",
+        rel_path="/models",
+        query_string="existing=1",
+        headers={"Accept": "application/json"},
+        body=b"",
+    )
+
+    assert prepared.rel_path == "/models"
+    assert prepared.query_string == "existing=1&client_version=1.0.0"
+    assert prepared.body == b""
+
+
+def test_codex_prepare_responses_sanitizes_open_webui_payload():
+    body = json.dumps({
+        "model": "gpt-5.5",
+        "input": "hello",
+        "max_output_tokens": 64,
+        "store": True,
+    }).encode()
+
+    prepared = CodexAdapter().prepare_request(
+        method="POST",
+        rel_path="/responses",
+        query_string="",
+        headers={"Content-Type": "application/json"},
+        body=body,
+    )
+    payload = json.loads(prepared.body.decode())
+
+    assert payload["input"] == [{"role": "user", "content": "hello"}]
+    assert payload["instructions"]
+    assert payload["stream"] is True
+    assert payload["store"] is False
+    assert "max_output_tokens" not in payload
+    assert payload["include"] == []
+    assert payload["reasoning"] == {"effort": "low", "summary": "auto"}
+    assert prepared.headers["Accept"] == "text/event-stream"
+    assert prepared.headers["session_id"]
+    assert prepared.headers["x-client-request-id"] == prepared.headers["session_id"]
+
+
+def test_codex_prepare_responses_maps_open_webui_reasoning_effort():
+    body = json.dumps({
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "reasoning_effort": "medium",
+    }).encode()
+
+    prepared = CodexAdapter().prepare_request(
+        method="POST",
+        rel_path="/responses",
+        query_string="",
+        headers={"Content-Type": "application/json"},
+        body=body,
+    )
+    payload = json.loads(prepared.body.decode())
+
+    assert "reasoning_effort" not in payload
+    assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+
+
+def test_codex_prepare_responses_preserves_explicit_reasoning_object():
+    body = json.dumps({
+        "model": "gpt-5.5",
+        "input": "hi",
+        "reasoning_effort": "low",
+        "reasoning": {"effort": "high", "summary": "detailed"},
+    }).encode()
+
+    prepared = CodexAdapter().prepare_request(
+        method="POST",
+        rel_path="/responses",
+        query_string="",
+        headers={"Content-Type": "application/json"},
+        body=body,
+    )
+    payload = json.loads(prepared.body.decode())
+
+    assert "reasoning_effort" not in payload
+    assert payload["reasoning"] == {"effort": "high", "summary": "detailed"}
+
+
+# ---------------------------------------------------------------------------
 # Server: path filtering + forwarding
 #
 # We run the proxy AND a fake upstream as real aiohttp servers on ephemeral
@@ -640,7 +830,10 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
         captured["requests"].append({
             "method": request.method,
             "path": request.path,
+            "query": request.query_string,
             "auth": request.headers.get("Authorization"),
+            "x_hook": request.headers.get("X-Hook"),
+            "accept": request.headers.get("Accept"),
             "body": body.decode("utf-8") if body else "",
         })
         return web.json_response({"echoed": True, "path": request.path})
@@ -655,10 +848,21 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
         await resp.write_eof()
         return resp
 
+    async def sse_without_content_type(request):
+        resp = web.StreamResponse(status=200)
+        await resp.prepare(request)
+        for chunk in [b"event: response.output_text.delta\n", b"data: {\"delta\":\"OK\"}\n\n"]:
+            await resp.write(chunk)
+        await resp.write_eof()
+        return resp
+
     app = web.Application()
     app.router.add_route("*", "/v1/chat/completions", echo)
     app.router.add_route("*", "/v1/embeddings", echo)
+    app.router.add_route("*", "/v1/models", echo)
+    app.router.add_route("*", "/v1/responses", echo)
     app.router.add_route("*", "/v1/sse", sse)
+    app.router.add_route("*", "/v1/sse-octet", sse_without_content_type)
     return app
 
 
@@ -704,6 +908,53 @@ def test_server_forwards_chat_completions():
             req = captured["requests"][0]
             assert req["auth"] == "Bearer real-portal-key"
             assert "Hermes-4-70B" in req["body"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_applies_adapter_prepare_request_hook():
+    class HookAdapter(FakeAdapter):
+        def prepare_request(self, *, method, rel_path, query_string, headers, body):
+            assert method == "POST"
+            assert rel_path == "/responses"
+            payload = json.loads(body.decode())
+            payload["hooked"] = True
+            next_headers = dict(headers)
+            next_headers["X-Hook"] = "applied"
+            next_headers["Accept"] = "text/event-stream"
+            return PreparedRequest(
+                method=method,
+                rel_path=rel_path,
+                query_string="client_version=1.0.0",
+                headers=next_headers,
+                body=json.dumps(payload).encode(),
+            )
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = HookAdapter(f"{upstream_base}/v1", allowed=["/responses"])
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json={"model": "gpt-5.5"},
+                    headers={"Authorization": "Bearer client-dummy-key"},
+                ) as resp:
+                    assert resp.status == 200
+                    await resp.json()
+
+            assert len(captured["requests"]) == 1
+            req = captured["requests"][0]
+            assert req["path"] == "/v1/responses"
+            assert req["query"] == "client_version=1.0.0"
+            assert req["x_hook"] == "applied"
+            assert req["accept"] == "text/event-stream"
+            assert json.loads(req["body"])["hooked"] is True
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
@@ -814,6 +1065,38 @@ def test_server_streams_sse():
                     full = b"".join(chunks)
                     assert b"data: hello" in full
                     assert b"data: [DONE]" in full
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_preserves_sse_content_type_when_upstream_omits_it():
+    class SseAdapter(FakeAdapter):
+        def prepare_request(self, *, method, rel_path, query_string, headers, body):
+            next_headers = dict(headers)
+            next_headers["Accept"] = "text/event-stream"
+            return PreparedRequest(
+                method=method,
+                rel_path=rel_path,
+                query_string=query_string,
+                headers=next_headers,
+                body=body,
+            )
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = SseAdapter(f"{upstream_base}/v1", allowed=["/sse-octet"])
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{proxy_base}/v1/sse-octet") as resp:
+                    assert resp.status == 200
+                    assert "text/event-stream" in resp.headers.get("Content-Type", "")
+                    body = await resp.read()
+                    assert b"response.output_text.delta" in body
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()

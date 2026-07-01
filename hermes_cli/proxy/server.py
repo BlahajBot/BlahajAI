@@ -81,6 +81,33 @@ def _filter_response_headers(headers) -> dict:
     return out
 
 
+def _accepts_event_stream(headers: dict) -> bool:
+    """Return True when the prepared upstream request expects SSE."""
+    for key, value in headers.items():
+        if key.lower() == "accept" and "text/event-stream" in str(value).lower():
+            return True
+    return False
+
+
+def _response_headers_for_client(upstream_headers, prepared_headers: dict) -> dict:
+    """Filter upstream headers and repair missing SSE content-type hints.
+
+    Some subscription backends stream SSE bytes but omit ``Content-Type``;
+    aiohttp then reports ``application/octet-stream``. Clients such as Open
+    WebUI decide whether to stream solely from this header, so when the
+    adapter explicitly requested ``Accept: text/event-stream`` we preserve that
+    semantic for the downstream client.
+    """
+    headers = _filter_response_headers(upstream_headers)
+    content_type = str(headers.get("Content-Type") or headers.get("content-type") or "")
+    if _accepts_event_stream(prepared_headers) and (
+        not content_type or content_type.lower().startswith("application/octet-stream")
+    ):
+        headers.pop("content-type", None)
+        headers["Content-Type"] = "text/event-stream"
+    return headers
+
+
 def create_app(adapter: UpstreamAdapter) -> "web.Application":
     """Build the aiohttp application bound to a specific upstream adapter."""
     if not AIOHTTP_AVAILABLE:
@@ -129,21 +156,35 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         # need to forward large multipart uploads we'll switch to streaming
         # the request body too.
         body = await request.read()
+        fwd_headers = _filter_request_headers(request.headers)
+        try:
+            prepared = adapter.prepare_request(
+                method=request.method,
+                rel_path=rel_path,
+                query_string=request.query_string,
+                headers=fwd_headers,
+                body=body,
+            )
+        except ValueError as exc:
+            return _json_error(400, str(exc), code="request_prepare_failed")
+        except Exception as exc:
+            logger.warning("proxy: request preparation failed: %s", exc)
+            return _json_error(500, str(exc), code="request_prepare_failed")
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
         async def _send_upstream(active_cred: UpstreamCredential):
-            upstream_url = f"{active_cred.base_url.rstrip('/')}{rel_path}"
+            upstream_url = f"{active_cred.base_url.rstrip('/')}{prepared.rel_path}"
             # Preserve query string verbatim.
-            if request.query_string:
-                upstream_url = f"{upstream_url}?{request.query_string}"
+            if prepared.query_string:
+                upstream_url = f"{upstream_url}?{prepared.query_string}"
 
-            fwd_headers = _filter_request_headers(request.headers)
-            fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            active_headers = dict(prepared.headers)
+            active_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
 
             logger.debug(
                 "proxy: forwarding %s %s -> %s (body=%d bytes)",
-                request.method, rel_path, upstream_url, len(body),
+                prepared.method, prepared.rel_path, upstream_url, len(prepared.body),
             )
 
             try:
@@ -153,10 +194,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
             try:
                 upstream_resp = await session.request(
-                    request.method,
+                    prepared.method,
                     upstream_url,
-                    data=body if body else None,
-                    headers=fwd_headers,
+                    data=prepared.body if prepared.body else None,
+                    headers=active_headers,
                     allow_redirects=False,
                 )
             except Exception:
@@ -215,7 +256,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         # Stream response back. Headers first, then chunked body.
         resp = web.StreamResponse(
             status=upstream_resp.status,
-            headers=_filter_response_headers(upstream_resp.headers),
+            headers=_response_headers_for_client(upstream_resp.headers, prepared.headers),
         )
         await resp.prepare(request)
 
