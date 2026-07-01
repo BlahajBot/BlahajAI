@@ -40,6 +40,14 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
+_approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_turn_id",
+    default="",
+)
+_approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_tool_call_id",
+    default="",
+)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -107,6 +115,27 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
         # flow is safety-critical, plugin observability is not.
         logger.debug("Approval hook %s dispatch failed: %s", hook_name, exc)
 
+
+
+def set_current_observability_context(
+    *,
+    turn_id: str = "",
+    tool_call_id: str = "",
+) -> tuple[contextvars.Token[str], contextvars.Token[str]]:
+    """Bind active tool correlation IDs to approval hooks."""
+    return (
+        _approval_turn_id.set(turn_id or ""),
+        _approval_tool_call_id.set(tool_call_id or ""),
+    )
+
+
+def reset_current_observability_context(
+    tokens: tuple[contextvars.Token[str], contextvars.Token[str]],
+) -> None:
+    """Restore prior approval hook correlation IDs."""
+    turn_token, tool_token = tokens
+    _approval_tool_call_id.reset(tool_token)
+    _approval_turn_id.reset(turn_token)
 
 
 def set_current_session_key(session_key: str) -> contextvars.Token[str]:
