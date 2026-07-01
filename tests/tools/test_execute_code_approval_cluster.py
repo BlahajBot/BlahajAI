@@ -251,16 +251,20 @@ def test_guard_gateway_missing_notify_is_pending(gw_session):
 def test_guard_smart_mode(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
 
-    monkeypatch.setattr(A, "_smart_approve", lambda c, d: "approve")
+    monkeypatch.setattr(A, "_smart_approve", lambda c, d: {"decision": "approve", "reason": "test"})
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is True and res.get("smart_approved") is True
+    # Clear session approval so the deny case isn't short-circuited by
+    # the is_approved() gate (smart-approve persists session approval).
+    with A._lock:
+        A._session_approved.get(gw_session, set()).discard("execute_code")
 
-    monkeypatch.setattr(A, "_smart_approve", lambda c, d: "deny")
+    monkeypatch.setattr(A, "_smart_approve", lambda c, d: {"decision": "deny", "reason": "test"})
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False and res.get("smart_denied") is True
 
     # escalate → falls through to manual gateway approval
-    monkeypatch.setattr(A, "_smart_approve", lambda c, d: "escalate")
+    monkeypatch.setattr(A, "_smart_approve", lambda c, d: {"decision": "escalate", "reason": "test"})
     _register_resolver(gw_session, "once")
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is True

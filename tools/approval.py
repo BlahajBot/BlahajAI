@@ -27,6 +27,11 @@ from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+# Freeze YOLO mode at module import time. Reading os.environ on every call
+# would allow any skill running inside the process to set this variable and
+# instantly bypass all approval checks — a prompt-injection escalation path.
+_YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
+
 # Per-thread/per-task gateway session identity.
 # Gateway runs agent turns concurrently in executor threads, so reading a
 # process-global env var for session identity is racy. Keep env fallback for
@@ -1420,8 +1425,9 @@ def check_dangerous_command(command: str, env_type: str,
         return _hardline_block_result(hardline_desc)
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled():
+    # CLI --yolo is frozen at import time via _YOLO_MODE_FROZEN (security:
+    # prevents prompt-injection from setting the env var mid-process).
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -1563,7 +1569,7 @@ def check_all_command_guards(command: str, env_type: str,
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off":
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -2032,26 +2038,46 @@ def check_execute_code_guard(code: str, env_type: str,
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
     # guards (restored by context propagation) still run independently.
+    smart_approval_fields: dict = {}
     if approval_mode == "smart":
-        verdict = _smart_approve(command, description)
+        smart_result = _smart_approve(command, description)
+        verdict = smart_result.get("decision", "escalate")
+        approval_reason = smart_result.get("reason", "")
+        logger.info(
+            "Smart approval verdict=%s for execute_code (session %s): %s",
+            verdict, session_key, approval_reason,
+        )
         if verdict == "approve":
-            logger.debug("Smart approval: auto-approved execute_code for session %s",
-                         session_key)
+            approve_session(session_key, pattern_key)
             return {"approved": True, "message": None,
-                    "smart_approved": True, "description": description}
+                    "smart_approved": True,
+                    "smart_approval_decision": verdict,
+                    "description": description,
+                    "approval_reason": approval_reason}
         if verdict == "deny":
+            rationale = f" Rationale: {approval_reason}" if approval_reason else ""
             return {
                 "approved": False,
-                "message": ("BLOCKED by smart approval: execute_code script "
-                            "execution was assessed as genuinely dangerous. "
-                            "Do NOT retry."),
+                "message": (
+                    f"BLOCKED by smart approval: execute_code script "
+                    f"execution was assessed as genuinely dangerous.{rationale} "
+                    "Do NOT retry."
+                ),
                 "smart_denied": True,
+                "smart_approval_decision": verdict,
+                "approval_reason": approval_reason,
                 "pattern_key": pattern_key,
                 "description": description,
                 "outcome": "denied",
                 "user_consent": False,
             }
-        # verdict == "escalate" → fall through to manual approval
+        # verdict == "escalate" → fall through to manual approval, keeping
+        # the rationale for the approval prompt.
+        smart_approval_fields = {
+            "smart_approval_decision": verdict,
+            "approval_reason": approval_reason,
+            "smart_escalated": True,
+        }
 
     notify_cb = None
     with _lock:
@@ -2060,12 +2086,14 @@ def check_execute_code_guard(code: str, env_type: str,
     if notify_cb is None:
         # No gateway callback registered (e.g. ask-mode without a notifier):
         # surface a pending approval for backward compatibility.
-        submit_pending(session_key, {
+        pending_data = {
             "command": command,
             "pattern_key": pattern_key,
             "pattern_keys": [pattern_key],
             "description": description,
-        })
+        }
+        pending_data.update(smart_approval_fields)
+        submit_pending(session_key, pending_data)
         return {
             "approved": False,
             "pattern_key": pattern_key,
@@ -2073,50 +2101,128 @@ def check_execute_code_guard(code: str, env_type: str,
             "approval_pending": True,
             "command": command,
             "description": description,
+            **smart_approval_fields,
             "message": (
                 f"⚠️ {description}. Asking the user for approval.\n\n"
                 f"**Code:**\n```python\n{code}\n```"
             ),
         }
 
+    # --- Blocking gateway approval (queue-based) ---
     approval_data = {
         "command": command,
         "pattern_key": pattern_key,
         "pattern_keys": [pattern_key],
         "description": description,
     }
-    decision = _await_gateway_decision(
-        session_key, notify_cb, approval_data, surface="gateway"
+    approval_data.update(smart_approval_fields)
+    entry = _ApprovalEntry(approval_data)
+    with _lock:
+        _gateway_queues.setdefault(session_key, []).append(entry)
+
+    _fire_approval_hook(
+        "pre_approval_request",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="gateway",
     )
-    if decision.get("notify_failed"):
+
+    try:
+        notify_cb(approval_data)
+    except Exception as exc:
+        logger.warning("Gateway approval notify failed: %s", exc)
+        with _lock:
+            queue = _gateway_queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
         return {
             "approved": False,
-            "message": ("BLOCKED: Failed to send execute_code approval request "
-                        "to user. Do NOT retry."),
+            "message": "BLOCKED: Failed to send execute_code approval request to user; command was NOT consented. Do NOT retry, rephrase, or use a different command for the same action.",
+            "user_consent": False,
+            "outcome": "notify_failed",
             "pattern_key": pattern_key,
             "description": description,
-            "outcome": "notify_failed",
-            "user_consent": False,
+            **smart_approval_fields,
         }
 
-    resolved = decision["resolved"]
-    choice = decision["choice"]
+    # Block until the user responds or timeout (default 5 min).
+    timeout = _get_approval_config().get("gateway_timeout", 300)
+    try:
+        timeout = int(timeout)
+    except (ValueError, TypeError):
+        timeout = 300
+
+    try:
+        from tools.environments.base import touch_activity_if_due
+    except Exception:  # pragma: no cover
+        touch_activity_if_due = None
+
+    _now = time.monotonic()
+    _deadline = _now + max(timeout, 0)
+    _activity_state = {"last_touch": _now, "start": _now}
+    resolved = False
+    while True:
+        _remaining = _deadline - time.monotonic()
+        if _remaining <= 0:
+            break
+        if entry.event.wait(timeout=min(1.0, _remaining)):
+            resolved = True
+            break
+        if touch_activity_if_due is not None:
+            touch_activity_if_due(
+                _activity_state, "waiting for user approval"
+            )
+
+    with _lock:
+        queue = _gateway_queues.get(session_key, [])
+        if entry in queue:
+            queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+
+    choice = entry.result
+    _outcome = (
+        "timeout" if not resolved
+        else (choice if choice else "timeout")
+    )
+    _fire_approval_hook(
+        "post_approval_response",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="gateway",
+        choice=_outcome,
+    )
 
     if not resolved or choice is None or choice == "deny":
-        reason = "timed out without user response" if not resolved else "denied by user"
-        addendum = " Silence is not consent." if not resolved else ""
+        if not resolved or choice is None:
+            reason = "timed out"
+            outcome = "timeout"
+            consent_note = "Silence is not consent."
+        else:
+            reason = "denied by user"
+            outcome = "denied"
+            consent_note = ""
+        message = (
+            f"BLOCKED: execute_code script {reason}; command was NOT consented. "
+            f"{consent_note} Do NOT retry, rephrase, or use a different command "
+            "for the same action."
+        )
         return {
             "approved": False,
-            "message": (
-                f"BLOCKED: execute_code script {reason}. The user has NOT "
-                f"consented to running this code. Do NOT retry, do NOT rephrase "
-                f"the script, and do NOT attempt the same outcome via a "
-                f"different tool.{addendum}"
-            ),
+            "message": " ".join(message.split()),
+            "user_consent": False,
+            "outcome": outcome,
             "pattern_key": pattern_key,
             "description": description,
-            "outcome": "timeout" if not resolved else "denied",
-            "user_consent": False,
+            **smart_approval_fields,
         }
 
     # Approved — persist based on scope (same logic as check_all_command_guards).
@@ -2129,7 +2235,8 @@ def check_execute_code_guard(code: str, env_type: str,
     # choice == "once": no persistence — approval lasts this single call only.
 
     return {"approved": True, "message": None,
-            "user_approved": True, "description": description}
+            "user_approved": True, "description": description,
+            **smart_approval_fields}
 
 
 # =========================================================================
@@ -2217,9 +2324,6 @@ def request_elicitation_consent(
     if choice in ("once", "session", "always"):
         return "accept"
     return "decline"
-
-
-# Load permanent allowlist from config on module import
 
 
 # Load permanent allowlist from config on module import

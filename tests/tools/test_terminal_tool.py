@@ -274,7 +274,7 @@ def test_smart_approval_guard_emits_progress_event(monkeypatch):
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards_impl",
-        lambda _command, _env_type, approval_callback=None, cwd=None: {
+        lambda _command, _env_type, approval_callback=None, cwd=None, has_host_access=False: {
             "approved": True,
             "smart_approved": True,
             "smart_approval_decision": "approve",
@@ -308,7 +308,7 @@ def test_deterministic_auto_approval_does_not_emit_progress_event(monkeypatch):
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards_impl",
-        lambda _command, _env_type, approval_callback=None, cwd=None: {
+        lambda _command, _env_type, approval_callback=None, cwd=None, has_host_access=False: {
             "approved": True,
             "auto_approved": True,
             "description": "read-only shell wrapper",
@@ -325,7 +325,7 @@ def test_deterministic_auto_approval_does_not_emit_progress_event(monkeypatch):
 def test_terminal_passes_effective_workdir_to_approval_context(monkeypatch, tmp_path):
     captured = {}
 
-    def fake_guard(command, env_type, approval_callback=None, cwd=None):
+    def fake_guard(command, env_type, approval_callback=None, cwd=None, has_host_access=False):
         captured["cwd"] = cwd
         return {"approved": True, "message": None}
 
