@@ -91,6 +91,30 @@ def test_executor_submit_with_copy_context_run_propagates():
     )
 
 
+def test_tool_executor_binds_recent_user_messages_for_smart_approval():
+    """The dispatcher should bind live user-turn context before tool execution."""
+    from agent.tool_executor import (
+        _bind_approval_user_messages_context,
+        _reset_approval_user_messages_context,
+    )
+    from tools.approval import get_current_user_messages_context
+
+    token = _bind_approval_user_messages_context([
+        {"role": "user", "content": "please clean the test artifact"},
+        {"role": "assistant", "content": "I'll remove it"},
+        {"role": "user", "content": "only delete ./tmp-artifact"},
+    ])
+    try:
+        assert get_current_user_messages_context() == (
+            "please clean the test artifact",
+            "only delete ./tmp-artifact",
+        )
+    finally:
+        _reset_approval_user_messages_context(token)
+
+    assert get_current_user_messages_context() == ()
+
+
 def test_run_tool_worker_sees_parent_approval_session_key():
     """End-to-end call-site guard.
 

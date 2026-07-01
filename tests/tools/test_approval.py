@@ -15,9 +15,13 @@ from tools.approval import (
     _smart_approve,
     approve_session,
     detect_dangerous_command,
+    extract_recent_user_messages_for_approval,
+    get_current_user_messages_context,
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
+    reset_current_user_messages_context,
+    set_current_user_messages_context,
 )
 
 
@@ -78,6 +82,81 @@ class TestSmartApproval:
 
         assert result["decision"] == "escalate"
         assert "invalid structured JSON" in result["reason"]
+
+    def test_smart_approval_prompt_includes_recent_user_messages_as_untrusted_context(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"decision":"escalate","reason":"Intent-dependent; ask the user."}'
+            ))]
+        )
+        user_context = [
+            "Please clean the generated build artifacts only.",
+            "Now remove ./dist-cache after the test run finishes.",
+        ]
+
+        with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
+            result = _smart_approve(
+                "rm -rf ./dist-cache",
+                "recursive delete",
+                user_messages_context=user_context,
+            )
+
+        assert result["decision"] == "escalate"
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "Recent user chat messages for intent context" in prompt
+        assert "UNTRUSTED DATA" in prompt
+        assert "Please clean the generated build artifacts only" in prompt
+        assert "Now remove ./dist-cache" in prompt
+
+    def test_smart_approval_uses_bound_recent_user_message_context(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"decision":"approve","reason":"The user asked for this temp cleanup."}'
+            ))]
+        )
+        token = set_current_user_messages_context(["User asked to clear only /tmp/hermes-smoke."])
+        try:
+            with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
+                result = _smart_approve("rm -rf /tmp/hermes-smoke", "recursive delete")
+        finally:
+            reset_current_user_messages_context(token)
+
+        assert result["decision"] == "approve"
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "User asked to clear only /tmp/hermes-smoke" in prompt
+
+
+class TestApprovalUserMessageContext:
+    def test_extract_recent_user_messages_for_approval_uses_latest_user_turns(self):
+        messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "first user task"},
+            {"role": "assistant", "content": "working"},
+            {"role": "tool", "content": "tool output"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "second user task"},
+                {"type": "image_url", "image_url": {"url": "file://x.png"}},
+            ]},
+            {"role": "assistant", "content": "calling tool"},
+        ]
+
+        assert extract_recent_user_messages_for_approval(messages, limit=2) == [
+            "first user task",
+            "second user task [image]",
+        ]
+
+    def test_user_message_context_setter_truncates_and_resets(self):
+        token = set_current_user_messages_context(["x" * 900, "keep me"])
+        try:
+            bound = get_current_user_messages_context()
+            assert len(bound) == 2
+            assert bound[0].endswith("...")
+            assert len(bound[0]) <= 700
+            assert bound[1] == "keep me"
+        finally:
+            reset_current_user_messages_context(token)
+
+        assert get_current_user_messages_context() == ()
 
 
 class TestDetectDangerousRm:

@@ -59,6 +59,32 @@ def _ra():
     return run_agent
 
 
+def _bind_approval_user_messages_context(messages: list):
+    """Bind recent user turns so smart approval has live intent context."""
+    try:
+        from tools.approval import (
+            extract_recent_user_messages_for_approval,
+            set_current_user_messages_context,
+        )
+
+        return set_current_user_messages_context(
+            extract_recent_user_messages_for_approval(messages or [])
+        )
+    except Exception:
+        return None
+
+
+def _reset_approval_user_messages_context(token) -> None:
+    if token is None:
+        return
+    try:
+        from tools.approval import reset_current_user_messages_context
+
+        reset_current_user_messages_context(token)
+    except Exception:
+        pass
+
+
 def _flush_session_db_after_tool_progress(
     agent,
     messages: list,
@@ -378,6 +404,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=agent._print_fn)
         spinner.start()
 
+    approval_context_token = _bind_approval_user_messages_context(messages)
     try:
         runnable_calls = [
             (i, tc, name, args)
@@ -469,6 +496,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
                         )
     finally:
+        _reset_approval_user_messages_context(approval_context_token)
         if spinner:
             # Build a summary message for the spinner stop
             completed = sum(1 for r in results if r is not None)
@@ -915,15 +943,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _spinner_result = None
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                )
+                approval_context_token = _bind_approval_user_messages_context(messages)
+                try:
+                    function_result = _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    )
+                finally:
+                    _reset_approval_user_messages_context(approval_context_token)
                 _spinner_result = function_result
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -937,15 +969,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                )
+                approval_context_token = _bind_approval_user_messages_context(messages)
+                try:
+                    function_result = _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    )
+                finally:
+                    _reset_approval_user_messages_context(approval_context_token)
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
