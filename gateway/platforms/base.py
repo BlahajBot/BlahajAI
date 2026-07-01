@@ -4677,6 +4677,30 @@ class BasePlatformAdapter(ABC):
         # never spawned, so no "typing…" / "is thinking…" status is shown.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+
+        async def _notify_media_delivery_failure(error: str | None) -> None:
+            """Send a visible notice when stripped native media upload fails."""
+            detail = (error or "unknown upload error").strip()
+            if len(detail) > 900:
+                detail = detail[:897] + "..."
+            try:
+                notice_result = await self._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=(
+                        "⚠️ I couldn't upload one of the generated attachments.\n"
+                        f"Reason: {detail}"
+                    ),
+                    reply_to=_reply_anchor_for_event(event),
+                    metadata=_thread_metadata,
+                )
+                _record_delivery(notice_result)
+            except Exception as notice_err:
+                logger.warning(
+                    "[%s] Failed to send media upload failure notice: %s",
+                    self.name,
+                    notice_err,
+                )
+
         typing_task: Optional[asyncio.Task] = None
         if getattr(self.config, "typing_indicator", True):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
@@ -4880,12 +4904,15 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
+                        if image_result is not None and not getattr(image_result, "success", False):
+                            await _notify_media_delivery_failure(getattr(image_result, "error", None))
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
@@ -4922,12 +4949,15 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
+                        if image_result is not None and not getattr(image_result, "success", False):
+                            await _notify_media_delivery_failure(getattr(image_result, "error", None))
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
