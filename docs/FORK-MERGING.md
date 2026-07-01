@@ -8,10 +8,26 @@ commit as merged (it's an ancestor of HEAD) even though its content never landed
 
 ## The failure mode to watch for
 
-The classic drop: the merge keeps a **call site** from one branch but drops the
-**definition** from the other. Result: HEAD references a symbol that no longer
-exists → the process crashes at runtime, not at merge time. Real examples from
-the June/July 2026 merge (`911a66d38`):
+A one-time audit of the June/July 2026 merge (`911a66d38`) found **18 silent
+drops across 6 files** this way — only 17 files had conflicts at all, so audit
+every one. Four recurring shapes:
+
+1. **Call site kept, definition dropped** — the most common and most dangerous.
+   `py_compile` passes (the lookup is deferred), so it detonates only at runtime.
+2. **Partial-hunk reversion** — one half of a hunk survives, the other reverts.
+   E.g. a wrapper kept its new `has_host_access` parameter but the *call site*
+   reverted to the no-arg form, silently defaulting a security flag to `False`.
+3. **Source upgraded, paired test dropped (or vice-versa)** — when one commit
+   touched both `src` and `tests`, the merge often took the fork's whole test
+   blob and discarded the upstream test *additions* even though HEAD shipped the
+   matching source change. Restore both halves together.
+4. **Conflict resolved wholesale toward the fork side** — pure upstream
+   *additions* to a region the fork never touched get dropped. These are never
+   intentional overrides.
+
+The classic drop (shape 1): the merge keeps a **call site** from one branch but
+drops the **definition** from the other. Result: HEAD references a symbol that no
+longer exists → the process crashes at runtime, not at merge time. Examples:
 
 | Kept | Dropped | Blast radius |
 |------|---------|--------------|
