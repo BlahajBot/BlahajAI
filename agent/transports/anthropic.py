@@ -87,7 +87,6 @@ class AnthropicTransport(ProviderTransport):
         from agent.anthropic_adapter import (
             _to_plain_data,
             _sanitize_replay_block,
-            anthropic_internal_tool_name,
         )
         from agent.transports.types import ToolCall
 
@@ -156,7 +155,6 @@ class AnthropicTransport(ProviderTransport):
                             name = single
                         elif _tool_registry.get_entry(bare):
                             name = bare
-                name = anthropic_internal_tool_name(name, base_url)
                 tool_calls.append(
                     ToolCall(
                         id=block.id,

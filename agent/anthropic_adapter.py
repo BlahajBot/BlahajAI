@@ -446,6 +446,19 @@ def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
     return normalized.rstrip("/").lower().startswith("https://api.kimi.com/coding")
 
 
+def _is_umans_endpoint(base_url: str | None) -> bool:
+    """Return True for the Umans code API (api.code.umans.ai).
+
+    Umans ships a server-side native ``web_search`` tool that collides with
+    Hermes's own web tools; we send ``X-Umans-Websearch-Provider: none`` to
+    turn it off so Hermes's tools pass through unchanged.
+    """
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    return "api.code.umans.ai" in normalized.lower()
+
+
 # Model-name prefixes that identify the Kimi / Moonshot family.  Covers
 # - official slugs: ``kimi-k2.5``, ``kimi_thinking``, ``moonshot-v1-8k``
 # - common release lines: ``k1.5-...``, ``k2-thinking``, ``k25-...``, ``k2.5-...``
@@ -825,6 +838,14 @@ def build_anthropic_client(
         kwargs["api_key"] = api_key
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+
+    # Umans (api.code.umans.ai) exposes a server-side native web_search tool
+    # that conflicts with Hermes's own web tools. Disable it per their docs so
+    # Hermes's tools reach the model unchanged (X-Umans-Websearch-Provider=none).
+    if _is_umans_endpoint(normalized_base_url or base_url):
+        _headers = dict(kwargs.get("default_headers") or {})
+        _headers["X-Umans-Websearch-Provider"] = "none"
+        kwargs["default_headers"] = _headers
 
     return _anthropic_sdk.Anthropic(**kwargs)
 
