@@ -1055,9 +1055,44 @@ _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
 )
 
 
+_MEDIA_DELIVERY_CACHE_SUBDIRS = (
+    "images",
+    "audio",
+    "videos",
+    "documents",
+    "screenshots",
+)
+
+
+def _profile_cache_roots() -> List[Path]:
+    """Return per-profile canonical cache roots under the shared Hermes root.
+
+    Profile gateways write generated artifacts to
+    ``<root>/profiles/<name>/cache/{images,audio,...}``. The static safe-roots
+    list only covers the *active* HERMES_HOME's cache, so a gateway running at
+    the root (e.g. ``HERMES_HOME=/opt/data``) while the model emits a
+    profile-scoped path silently fails delivery. Enumerated dynamically at
+    check time so profiles created after startup are covered, and so the
+    resolved profile path is allowlisted *before* the ``/root`` system denylist
+    is consulted (which otherwise wins when HERMES_HOME is symlinked under a
+    denied prefix and $HOME is not that prefix). See issue #31733.
+    """
+    roots: List[Path] = []
+    profiles_dir = _HERMES_ROOT / "profiles"
+    try:
+        profile_dirs = [p for p in profiles_dir.iterdir() if p.is_dir()]
+    except OSError:
+        return roots
+    for profile_dir in profile_dirs:
+        for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS:
+            roots.append(profile_dir / "cache" / subdir)
+    return roots
+
+
 def _media_delivery_allowed_roots() -> List[Path]:
     """Return roots from which model-emitted local media may be delivered."""
     roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
+    roots.extend(_profile_cache_roots())
     extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
     for chunk in extra_roots.split(os.pathsep):
         for raw_root in chunk.split(","):
@@ -1449,6 +1484,52 @@ MEDIA_TAG_CLEANUP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Extension-less absolute paths (e.g. Caddyfile, Dockerfile, Makefile) are
+# intentionally excluded from MEDIA_TAG_CLEANUP_RE — they are validated and
+# delivered via MEDIA_EXTENSIONLESS_TAG_RE so prompt-injection paths that do
+# not exist on disk are left visible instead of silently dropped. Paths with
+# an unknown but present extension (e.g. .weirdext) stay on the #34517
+# bare-path fallback and are not handled here.
+MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
+    r'''[`"']?MEDIA:\s*'''
+    r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
+    r'''(?:~/|/|[A-Za-z]:[/\\])[^\s\n`"']+)'''
+    r'''[`"']?\s*''',
+    re.IGNORECASE,
+)
+
+
+def _normalize_media_tag_path(raw: str) -> str:
+    path = str(raw or "").strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+        path = path[1:-1].strip()
+    return path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+
+
+def _path_lacks_deliverable_extension(path: str) -> bool:
+    """True only when the basename has no extension (Caddyfile, Makefile, …)."""
+    return not Path(path).suffix
+
+
+def _strip_media_tag_directives(text: str) -> str:
+    """Remove MEDIA: tags and [[audio_as_voice]] / [[as_document]] markers."""
+    if (
+        "MEDIA:" not in text
+        and "[[audio_as_voice]]" not in text
+        and "[[as_document]]" not in text
+    ):
+        return text
+    cleaned = text.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
+
+    def _strip_extensionless(match: re.Match) -> str:
+        path = _normalize_media_tag_path(match.group("path"))
+        if not path or not _path_lacks_deliverable_extension(path):
+            return match.group(0)
+        return "" if validate_media_delivery_path(path) else match.group(0)
+
+    cleaned = MEDIA_TAG_CLEANUP_RE.sub("", cleaned)
+    return MEDIA_EXTENSIONLESS_TAG_RE.sub(_strip_extensionless, cleaned)
+
 
 def get_document_cache_dir() -> Path:
     """Return the document cache directory, creating it if it doesn't exist."""
@@ -1698,6 +1779,13 @@ class MessageEvent:
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
+
+    # Free-form per-event metadata.  Adapters may set platform-specific
+    # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
+    # the bridge is configured to forward owner-typed messages).  Plugins
+    # consume via ``event.metadata.get(...)`` and must not rely on any
+    # particular key existing.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -2119,13 +2207,13 @@ def _strip_media_directives(text: str) -> str:
     Backstop only: run ``extract_media`` first. MEDIA cleanup uses the shared
     ``MEDIA_TAG_CLEANUP_RE`` (only tags whose path has a known deliverable
     extension are removed; an unknown-extension tag is intentionally left so the
-    bare-path detector downstream can still pick it up, per #34517). [[...]] is
-    exact.
+    bare-path detector downstream can still pick it up, per #34517). Validated
+    extension-less tags (e.g. ``MEDIA:/output/Caddyfile``) are also removed.
+    [[...]] is exact.
     """
     if not text:
         return text
-    text = text.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
-    return MEDIA_TAG_CLEANUP_RE.sub("", text)
+    return _strip_media_tag_directives(text)
 
 
 class BasePlatformAdapter(ABC):
@@ -3118,7 +3206,14 @@ class BasePlatformAdapter(ABC):
         or file attachments (Discord). Default falls back to sending the
         file path as text.
         """
-        text = f"🔊 Audio: {audio_path}"
+        # audio_path is intentionally NOT included in the chat text — it is a
+        # host-local path that leaks filesystem layout. The path is logged for
+        # operator diagnostics instead.
+        logger.warning(
+            "[%s] send_voice fallback: native audio send unavailable for %s",
+            self.name, audio_path,
+        )
+        text = "⚠️ Couldn't deliver the audio attachment."
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -3159,7 +3254,12 @@ class BasePlatformAdapter(ABC):
         Override in subclasses to send videos as inline playable media.
         Default falls back to sending the file path as text.
         """
-        text = f"🎬 Video: {video_path}"
+        # See send_voice for the rationale: do not echo host paths into chat.
+        logger.warning(
+            "[%s] send_video fallback: native video send unavailable for %s",
+            self.name, video_path,
+        )
+        text = "⚠️ Couldn't deliver the video attachment."
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -3180,7 +3280,18 @@ class BasePlatformAdapter(ABC):
         Override in subclasses to send files as downloadable attachments.
         Default falls back to sending the file path as text.
         """
-        text = f"📎 File: {file_path}"
+        # See send_voice for the rationale: do not echo host paths into chat.
+        logger.warning(
+            "[%s] send_document fallback: native file send unavailable for %s",
+            self.name, file_path,
+        )
+        # file_name is supplied by callers and represents the user-facing
+        # filename (already non-sensitive — it is what the agent named the
+        # output). Only show it when the caller passed one explicitly.
+        if file_name:
+            text = f"⚠️ Couldn't deliver the file attachment ({file_name})."
+        else:
+            text = "⚠️ Couldn't deliver the file attachment."
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -3201,7 +3312,12 @@ class BasePlatformAdapter(ABC):
         Override in subclasses for native photo attachments.
         Default falls back to sending the file path as text.
         """
-        text = f"🖼️ Image: {image_path}"
+        # See send_voice for the rationale: do not echo host paths into chat.
+        logger.warning(
+            "[%s] send_image_file fallback: native image send unavailable for %s",
+            self.name, image_path,
+        )
+        text = "⚠️ Couldn't deliver the image attachment."
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -3370,10 +3486,7 @@ class BasePlatformAdapter(ABC):
         scan_content = BasePlatformAdapter._mask_protected_spans(content)
         scan_content = BasePlatformAdapter._mask_json_string_media(scan_content)
         for match in media_pattern.finditer(scan_content):
-            path = match.group("path").strip()
-            if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
-                path = path[1:-1].strip()
-            path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+            path = _normalize_media_tag_path(match.group("path"))
             if path:
                 try:
                     media.append((os.path.expanduser(path), has_voice_tag))
@@ -3381,6 +3494,16 @@ class BasePlatformAdapter(ABC):
                     # Skip a crafted ~\x00 path rather than aborting extraction
                     # and dropping every other attachment in the response.
                     continue
+
+        seen_paths = {p for p, _ in media}
+        for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan_content):
+            path = _normalize_media_tag_path(match.group("path"))
+            if not path or not _path_lacks_deliverable_extension(path):
+                continue
+            safe = validate_media_delivery_path(path)
+            if safe and safe not in seen_paths:
+                media.append((safe, has_voice_tag))
+                seen_paths.add(safe)
 
         # Remove the delivered MEDIA tags from the user-visible text. Mask a
         # length-equal copy of ``cleaned`` (same union of protected regions) to
@@ -3394,6 +3517,12 @@ class BasePlatformAdapter(ABC):
             masked_cleaned = BasePlatformAdapter._mask_protected_spans(cleaned)
             masked_cleaned = BasePlatformAdapter._mask_json_string_media(masked_cleaned)
             spans = [m.span() for m in media_pattern.finditer(masked_cleaned)]
+            for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(masked_cleaned):
+                path = _normalize_media_tag_path(match.group("path"))
+                if not path or not _path_lacks_deliverable_extension(path):
+                    continue
+                if validate_media_delivery_path(path):
+                    spans.append(match.span())
             if spans:
                 chars = list(cleaned)
                 for start, end in sorted(spans, reverse=True):
@@ -3402,6 +3531,25 @@ class BasePlatformAdapter(ABC):
                 cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
         return media, cleaned
+
+    @staticmethod
+    def strip_media_directives_for_display(text: str) -> str:
+        """Strip MEDIA: directives from streamed/display text.
+
+        Known-extension tags are removed unconditionally (same as
+        ``MEDIA_TAG_CLEANUP_RE``). Extension-less tags are removed only when
+        ``validate_media_delivery_path`` accepts the path so undeliverable
+        paths stay visible for debugging.
+        """
+        if (
+            "MEDIA:" not in text
+            and "[[audio_as_voice]]" not in text
+            and "[[as_document]]" not in text
+        ):
+            return text
+        cleaned = _strip_media_tag_directives(text)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        return cleaned.rstrip()
 
     @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
@@ -4300,7 +4448,8 @@ class BasePlatformAdapter(ABC):
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
         # (Telegram DM topic mode) so the session key, guard checks, and
         # downstream delivery all agree on the same lane.
-        self._apply_topic_recovery(event)
+        # Offloaded: the sync hook must not block the loop.
+        await asyncio.to_thread(self._apply_topic_recovery, event)
 
         session_key = build_session_key(
             event.source,
@@ -4523,21 +4672,26 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         
-        # Start continuous typing indicator (refreshes every 2 seconds)
+        # Start continuous typing indicator (refreshes every 2 seconds).
+        # Gated per-platform: when typing_indicator=False the refresh loop is
+        # never spawned, so no "typing…" / "is thinking…" status is shown.
+        # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-        _keep_typing_kwargs = {"metadata": _thread_metadata}
-        try:
-            _keep_typing_sig = inspect.signature(self._keep_typing)
-        except (TypeError, ValueError):
-            _keep_typing_sig = None
-        if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
-            _keep_typing_kwargs["stop_event"] = interrupt_event
-        typing_task = asyncio.create_task(
-            self._keep_typing(
-                event.source.chat_id,
-                **_keep_typing_kwargs,
+        typing_task: Optional[asyncio.Task] = None
+        if getattr(self.config, "typing_indicator", True):
+            _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
+            try:
+                _keep_typing_sig = inspect.signature(self._keep_typing)
+            except (TypeError, ValueError):
+                _keep_typing_sig = None
+            if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
+                _keep_typing_kwargs["stop_event"] = interrupt_event
+            typing_task = asyncio.create_task(
+                self._keep_typing(
+                    event.source.chat_id,
+                    **_keep_typing_kwargs,
+                )
             )
-        )
 
         async def _stop_typing_task() -> None:
             await self._stop_typing_refresh(
