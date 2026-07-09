@@ -4122,6 +4122,11 @@ class DiscordAdapter(BasePlatformAdapter):
             for cmd_def in COMMAND_REGISTRY:
                 if not _is_gateway_available(cmd_def, config_overrides):
                     continue
+                # Keep /spark as a text command on Discord: the argument is the
+                # actual prompt and native slash options are not visible in
+                # channel history, which makes Spark turns look contextless.
+                if cmd_def.name == "spark":
+                    continue
                 # Discord command names: lowercase, hyphens OK, max 32 chars.
                 discord_name = cmd_def.name.lower()[:32]
                 if discord_name in already_registered:
@@ -4184,7 +4189,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
         # supporting up to 25 categories × 25 skills = 625 skills.
-        self._register_skill_group(tree)
+        if os.getenv("DISCORD_REGISTER_SKILL_COMMANDS", "true").strip().lower() not in {"0", "false", "no", "off"}:
+            self._register_skill_group(tree)
 
         if dropped_over_cap:
             # Staying under the cap keeps the whole sync succeeding; without
@@ -4798,6 +4804,8 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         limit = self._discord_history_backfill_limit()
         if limit <= 0:
+            return ""
+        if not callable(getattr(channel, "history", None)):
             return ""
 
         # Determine which bot messages to include in context
@@ -7557,6 +7565,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+    if "register_skill_commands" in discord_cfg and not os.getenv("DISCORD_REGISTER_SKILL_COMMANDS"):
+        os.environ["DISCORD_REGISTER_SKILL_COMMANDS"] = str(discord_cfg["register_skill_commands"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     # ignored_channels: channels where bot never responds (even when mentioned)

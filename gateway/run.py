@@ -66,6 +66,8 @@ from hermes_cli.fallback_config import get_fallback_chain
 # from _enforce_agent_cache_cap() and _session_expiry_watcher() below.
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+_SPARK_MODEL = "gpt-5.3-codex-spark"
+_SPARK_PROVIDER = "openai-codex"
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
@@ -3883,13 +3885,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict, *, spark_lane: bool = False) -> dict:
         """Build the effective model/runtime config for a single turn.
 
-        Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        Normally uses the session's primary model/provider. ``/spark`` is a
+        one-shot model override: it does not mutate the session default and
+        never inherits `/fast` service-tier overrides.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -3903,6 +3904,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+        if spark_lane:
+            model = _SPARK_MODEL
+            if runtime.get("provider") != _SPARK_PROVIDER:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                spark_runtime = resolve_runtime_provider(requested=_SPARK_PROVIDER)
+                runtime.update(
+                    {
+                        "api_key": spark_runtime.get("api_key"),
+                        "base_url": spark_runtime.get("base_url"),
+                        "provider": spark_runtime.get("provider", _SPARK_PROVIDER),
+                        "api_mode": spark_runtime.get("api_mode"),
+                        "command": spark_runtime.get("command"),
+                        "args": list(spark_runtime.get("args") or []),
+                        "credential_pool": spark_runtime.get("credential_pool"),
+                    }
+                )
         route = {
             "model": model,
             "runtime": runtime,
@@ -3915,6 +3933,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 tuple(runtime["args"]),
             ),
         }
+
+        if spark_lane:
+            route["request_overrides"] = {}
+            route["spark_lane"] = True
+            return route
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -9263,6 +9286,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # doesn't think an agent is still active.
                 return await self._handle_reset_command(event)
 
+            # /spark <prompt> — queue a one-shot Codex Spark turn without
+            # interrupting the current run.
+            if _cmd_def_inner and _cmd_def_inner.name == "spark":
+                spark_text = event.get_command_args().strip()
+                if not spark_text:
+                    return "Usage: /spark <prompt>"
+                if getattr(event, "media_urls", None):
+                    return "/spark is text-only; send image prompts through the regular session."
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    queued_event = MessageEvent(
+                        text=spark_text,
+                        message_type=MessageType.TEXT,
+                        source=event.source,
+                        raw_message=event.raw_message,
+                        message_id=event.message_id,
+                        channel_prompt=None,
+                        internal=event.internal,
+                        timestamp=event.timestamp,
+                    )
+                    setattr(queued_event, "spark_lane", True)
+                    self._enqueue_fifo(_quick_key, queued_event, adapter)
+                depth = self._queue_depth(_quick_key, adapter=self._adapter_for_source(source))
+                return "Queued one-shot Spark prompt." if depth <= 1 else f"Queued one-shot Spark prompt. ({depth} queued)"
+
             # /queue <prompt> — queue without interrupting.
             # Semantics: each /queue invocation produces its own full agent
             # turn, processed in FIFO order after the current run (and any
@@ -9771,6 +9819,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # fall through to agent processing
             except Exception:
                 return "Could not start /learn — please try again."
+
+        if canonical == "spark":
+            spark_payload = event.get_command_args().strip()
+            if not spark_payload:
+                return "Usage: /spark <prompt>"
+            if getattr(event, "media_urls", None):
+                return "/spark is text-only; send image prompts through the regular session."
+            event.text = spark_payload
+            setattr(event, "spark_lane", True)
+            command = None
+            canonical = None
 
         if canonical == "fast":
             return await self._handle_fast_command(event)
@@ -11516,17 +11575,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_start_session_id = session_entry.session_id
             agent_result = await self._run_agent(
                 message=message_text,
-                context_prompt=context_prompt,
+                context_prompt="" if bool(getattr(event, "spark_lane", False)) else context_prompt,
                 history=history,
                 source=source,
                 session_id=_run_start_session_id,
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
+                channel_prompt=None if bool(getattr(event, "spark_lane", False)) else event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                spark_lane=bool(getattr(event, "spark_lane", False)),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -16822,6 +16882,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        spark_lane: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -16840,6 +16901,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                spark_lane=spark_lane,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -16851,6 +16913,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                spark_lane=spark_lane,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -16883,6 +16946,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        spark_lane: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -18029,7 +18093,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                model,
+                runtime_kwargs,
+                spark_lane=spark_lane,
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -18775,7 +18844,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     observed_group_context,
                 )
                 _conversation_kwargs = {
-                    "conversation_history": agent_history,
+                    "conversation_history": [] if spark_lane else agent_history,
                     "task_id": session_id,
                 }
                 if _persist_user_message_override is not None:

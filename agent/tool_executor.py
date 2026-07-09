@@ -117,6 +117,32 @@ def _ra():
     return run_agent
 
 
+def _bind_approval_user_messages_context(messages: list):
+    """Bind recent user turns so smart approval has live intent context."""
+    try:
+        from tools.approval import (
+            extract_recent_user_messages_for_approval,
+            set_current_user_messages_context,
+        )
+
+        return set_current_user_messages_context(
+            extract_recent_user_messages_for_approval(messages or [])
+        )
+    except Exception:
+        return None
+
+
+def _reset_approval_user_messages_context(token) -> None:
+    if token is None:
+        return
+    try:
+        from tools.approval import reset_current_user_messages_context
+
+        reset_current_user_messages_context(token)
+    except Exception:
+        pass
+
+
 def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return "cannot schedule new futures after interpreter shutdown" in str(exc)
 
@@ -625,6 +651,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=agent._print_fn)
         spinner.start()
 
+    approval_context_token = _bind_approval_user_messages_context(messages)
     try:
         runnable_calls = [
             (i, tc, name, args)
@@ -784,6 +811,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     cancel_futures=abandon_executor,
                 )
     finally:
+        _reset_approval_user_messages_context(approval_context_token)
         if spinner:
             # Build a summary message for the spinner stop
             completed = sum(1 for r in results if r is not None)
@@ -1402,20 +1430,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=agent._print_fn)
                 spinner.start()
             _spinner_result = None
+            approval_context_token = _bind_approval_user_messages_context(messages)
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+                try:
+                    function_result = _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
+                finally:
+                    _reset_approval_user_messages_context(approval_context_token)
                 _spinner_result = function_result
             except KeyboardInterrupt:
                 function_result = _emit_cancelled_terminal_post_tool_call(
@@ -1444,20 +1476,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
         else:
+            approval_context_token = _bind_approval_user_messages_context(messages)
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+                try:
+                    function_result = _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
+                finally:
+                    _reset_approval_user_messages_context(approval_context_token)
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
                     agent,

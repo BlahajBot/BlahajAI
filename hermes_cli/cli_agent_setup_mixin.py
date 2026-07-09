@@ -18,6 +18,8 @@ import sys
 
 from rich.markup import escape as _escape
 
+_USE_DEFAULT_SESSION_DB = object()
+
 
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
@@ -171,15 +173,19 @@ class CLIAgentSetupMixin:
 
         return True
 
-    def _resolve_turn_agent_config(self, user_message: str) -> dict:
+    def _resolve_turn_agent_config(self, user_message: str, *, spark_lane: bool = False) -> dict:
         """Build the effective model/runtime config for a single user turn.
 
-        Always uses the session's primary model/provider.  If the user has
-        toggled `/fast` on and the current model supports Priority
-        Processing / Anthropic fast mode, attach `request_overrides` so the
-        API call is marked accordingly.
+        Normally uses the session's primary model/provider. ``/spark`` is a
+        one-shot model override: it does not mutate the session default and
+        never inherits `/fast` service-tier overrides.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
+
+        # Keep local to avoid importing cli.py from this mixin (which would be
+        # circular during normal CLI startup).
+        _spark_model = "gpt-5.3-codex-spark"
+        _spark_provider = "openai-codex"
 
         runtime = {
             "api_key": self.api_key,
@@ -190,11 +196,28 @@ class CLIAgentSetupMixin:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+        model = self.model
+        if spark_lane:
+            model = _spark_model
+            if runtime.get("provider") != _spark_provider:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                spark_runtime = resolve_runtime_provider(requested=_spark_provider)
+                runtime = {
+                    "api_key": spark_runtime.get("api_key"),
+                    "base_url": spark_runtime.get("base_url"),
+                    "provider": spark_runtime.get("provider", _spark_provider),
+                    "api_mode": spark_runtime.get("api_mode"),
+                    "command": spark_runtime.get("command"),
+                    "args": list(spark_runtime.get("args") or []),
+                    "credential_pool": spark_runtime.get("credential_pool"),
+                }
+
         route = {
-            "model": self.model,
+            "model": model,
             "runtime": runtime,
             "signature": (
-                self.model,
+                model,
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
@@ -202,6 +225,11 @@ class CLIAgentSetupMixin:
                 tuple(runtime["args"]),
             ),
         }
+
+        if spark_lane:
+            route["request_overrides"] = None
+            route["spark_lane"] = True
+            return route
 
         service_tier = getattr(self, "service_tier", None)
         if not service_tier:
@@ -215,7 +243,7 @@ class CLIAgentSetupMixin:
         route["request_overrides"] = overrides
         return route
 
-    def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:
+    def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None, session_db_override=_USE_DEFAULT_SESSION_DB) -> bool:
         """
         Initialize the agent on first use.
         When resuming a session, restores conversation history from SQLite.
@@ -371,7 +399,11 @@ class CLIAgentSetupMixin:
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id,
                 platform="cli",
-                session_db=self._session_db,
+                session_db=(
+                    self._session_db
+                    if session_db_override is _USE_DEFAULT_SESSION_DB
+                    else session_db_override
+                ),
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
 

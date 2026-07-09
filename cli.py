@@ -52,7 +52,7 @@ os.environ["HERMES_QUIET"] = "1"  # Our own modules
 import yaml
 
 from hermes_cli.fallback_config import get_fallback_chain
-from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin, _USE_DEFAULT_SESSION_DB
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 
 # prompt_toolkit for fixed input area TUI
@@ -163,6 +163,46 @@ def realign_markdown_tables(*args, **kwargs):
 from hermes_cli.banner import _format_context_length, format_banner_version_label
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_SPARK_MODEL = "gpt-5.3-codex-spark"
+_SPARK_PROVIDER = "openai-codex"
+
+
+def _history_for_spark_turn(prior_history: list[dict]) -> list[dict]:
+    """Spark turns intentionally run without prior transcript context."""
+    return []
+
+
+def _merge_spark_turn_history(prior_history: list[dict], spark_messages: list[dict] | None) -> list[dict]:
+    """Keep Spark's prompt/answer visible to the main lane afterwards."""
+    return list(prior_history) + list(spark_messages or [])
+
+
+def _persist_spark_messages_to_session_db(session_db, session_id: str, spark_messages: list[dict] | None) -> None:
+    """Append Spark's prompt/answer to the active session DB when available."""
+    if session_db is None or not session_id or not spark_messages:
+        return
+    append_message = getattr(session_db, "append_message", None)
+    if append_message is None:
+        return
+    for msg in spark_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if not role or role == "system":
+            continue
+        try:
+            append_message(session_id, role, msg.get("content"))
+        except TypeError:
+            try:
+                append_message(session_id, msg)
+            except Exception:
+                return
+        except Exception:
+            return
+
+
+def _spark_usage_text() -> str:
+    return "Usage: /spark <prompt> — runs one prompt on gpt-5.3-codex-spark, with no prior transcript context."
 
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
@@ -8711,6 +8751,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_reasoning_command(cmd_original)
         elif canonical == "fast":
             self._handle_fast_command(cmd_original)
+        elif canonical == "spark":
+            payload = cmd_original.split(maxsplit=1)[1].strip() if len(cmd_original.split(maxsplit=1)) > 1 else ""
+            if not payload:
+                self._console_print(f"  {_spark_usage_text()}")
+            elif hasattr(self, "_pending_input"):
+                self._pending_input.put(("__spark__", payload))
+                self._console_print("  Queued one-shot Spark prompt")
+            else:
+                self.chat(payload, spark_lane=True)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
         elif canonical == "usage":
@@ -12065,7 +12114,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None) -> Optional[str]:
+    def chat(self, message, images: list = None, spark_lane: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
 
@@ -12094,12 +12143,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
 
+        if spark_lane and images:
+            _cprint("  /spark is text-only; send image prompts through the regular session.")
+            return None
+
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
             return None
 
-        turn_route = self._resolve_turn_agent_config(message)
-        if turn_route["signature"] != self._active_agent_route_signature:
+        turn_route = self._resolve_turn_agent_config(message, spark_lane=spark_lane)
+        saved_agent = self.agent if spark_lane else None
+        saved_route_signature = self._active_agent_route_signature if spark_lane else None
+        if spark_lane:
+            self.agent = None
+            self._active_agent_route_signature = None
+        elif turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
         # Initialize agent if needed
@@ -12109,8 +12167,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
+            session_db_override=None if spark_lane else _USE_DEFAULT_SESSION_DB,
         ):
+            if spark_lane:
+                self.agent = saved_agent
+                self._active_agent_route_signature = saved_route_signature
             return None
+        if spark_lane and self.agent is not None:
+            try:
+                self.agent._save_session_log = lambda *args, **kwargs: None
+            except Exception:
+                pass
 
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -12200,6 +12267,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             message = _sanitize_surrogates(message)
 
         # Add user message to history
+        history_before_turn = list(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": message})
 
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
@@ -12337,10 +12405,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self._pending_moa_config = None
                 if _moa_cfg is None:
                     _moa_cfg = None
+                agent_history = (
+                    _history_for_spark_turn(self.conversation_history[:-1])
+                    if spark_lane
+                    else self.conversation_history[:-1]
+                )
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                        conversation_history=agent_history,  # Exclude the message we just added
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=message if _voice_prefix else None,
@@ -12520,8 +12593,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             sys.stdout.flush()
             time.sleep(0.15)
 
-            # Update history with full conversation
-            self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+            # Update history with full conversation. Spark runs prompt-only,
+            # but its prompt/answer become durable main-session context.
+            if spark_lane and result:
+                spark_messages = result.get("messages", [])
+                self.conversation_history = _merge_spark_turn_history(
+                    history_before_turn,
+                    spark_messages,
+                )
+                _persist_spark_messages_to_session_db(
+                    self._session_db,
+                    self.session_id,
+                    spark_messages,
+                )
+            else:
+                self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -12758,6 +12844,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 stop_event.set()
             if tts_thread is not None and tts_thread.is_alive():
                 tts_thread.join(timeout=5)
+            if spark_lane:
+                self.agent = saved_agent
+                self._active_agent_route_signature = saved_route_signature
+                try:
+                    global _active_agent_ref
+                    _active_agent_ref = saved_agent
+                except Exception:
+                    pass
 
     def _clear_terminal_on_exit(self):
         """Clear screen + scrollback so nothing is stranded above the exit summary.
@@ -15183,10 +15277,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
 
-                    # Unpack image payload: (text, [Path, ...]) or plain str
+                    # Unpack image payload: (text, [Path, ...]) or plain str.
+                    # /spark uses ("__spark__", prompt) to request one
+                    # prompt-only Codex Spark turn.
                     submit_images = []
+                    spark_lane = False
                     if isinstance(user_input, tuple):
-                        user_input, submit_images = user_input
+                        if len(user_input) == 2 and user_input[0] == "__spark__":
+                            spark_lane = True
+                            user_input = user_input[1]
+                            submit_images = []
+                        else:
+                            user_input, submit_images = user_input
 
                     if isinstance(user_input, str):
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
@@ -15269,7 +15371,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        self.chat(user_input, images=submit_images or None, spark_lane=spark_lane)
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
