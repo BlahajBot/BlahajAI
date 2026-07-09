@@ -17244,6 +17244,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
                 return
 
+            # Render out-of-band approval audit events without pretending they
+            # are provider-visible assistant tool calls.
+            if event_type == "approval.judged":
+                msg = _format_approval_progress_message(args)
+                if msg:
+                    progress_queue.put(msg)
+                return
+
             # "_thinking" is assistant scratch text between tool calls.  It
             # is never ordinary tool progress: only relay it when the platform
             # explicitly opted into thinking_progress.  Handle both legacy
