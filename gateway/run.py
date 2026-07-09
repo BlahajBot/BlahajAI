@@ -109,6 +109,20 @@ def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
 
 
+def _format_approval_progress_message(args: Optional[dict]) -> Optional[str]:
+    """Render an out-of-band smart-approval audit event for tool progress."""
+    if not isinstance(args, dict) or args.get("source") != "smart_approval":
+        return None
+    decision = str(args.get("decision") or "").strip().lower()
+    if decision not in {"approve", "deny", "escalate"}:
+        return None
+    reason = str(args.get("reason") or "").strip()
+    msg = f"🛡️ smart approval: {decision}"
+    if reason:
+        msg += f" — {reason}"
+    return msg
+
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"

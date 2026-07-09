@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +31,24 @@ _PNG_HEX = (
 def _b64_png() -> str:
     import base64
     return base64.b64encode(bytes.fromhex(_PNG_HEX)).decode()
+
+
+class _FakeStream:
+    def __init__(self, events, final_response):
+        self._events = list(events)
+        self._final = final_response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def get_final_response(self):
+        return self._final
 
 
 @pytest.fixture(autouse=True)

@@ -1,5 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import json
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -9,6 +11,178 @@ def setup_function():
 
 def teardown_function():
     terminal_tool._reset_cached_sudo_passwords()
+    if hasattr(terminal_tool, "set_approval_progress_callback"):
+        terminal_tool.set_approval_progress_callback(None)
+    if hasattr(terminal_tool, "_set_approval_context_cwd"):
+        terminal_tool._set_approval_context_cwd(None)
+
+
+def test_terminal_result_includes_smart_escalation_rationale_after_user_approval(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda _command, _env_type, **_kwargs: {
+            "approved": True,
+            "user_approved": True,
+            "smart_escalated": True,
+            "smart_approval_decision": "escalate",
+            "description": "shell command via -c/-lc flag",
+            "approval_reason": "The command performs network service probing.",
+        },
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            "printf ok",
+            timeout=5,
+            task_id="test-smart-escalation-terminal-note",
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert result["output"] == "ok"
+    assert "required approval" in result["approval"]
+    assert "smart approval escalated" in result["approval"]
+    assert "network service probing" in result["approval"]
+
+
+def test_terminal_blocked_result_includes_smart_deny_rationale(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda _command, _env_type, **_kwargs: {
+            "approved": False,
+            "smart_denied": True,
+            "smart_approval_decision": "deny",
+            "description": "recursive delete",
+            "approval_reason": "The command could destroy project files.",
+            "message": "BLOCKED by smart approval: recursive delete.",
+        },
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            "printf should-not-run",
+            timeout=5,
+            task_id="test-smart-deny-terminal-note",
+        )
+    )
+
+    assert result["status"] == "blocked"
+    assert "BLOCKED by smart approval" in result["error"]
+    assert "denied by smart approval" in result["approval"]
+    assert "destroy project files" in result["approval"]
+
+
+def test_terminal_result_includes_smart_approve_rationale(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda _command, _env_type, **_kwargs: {
+            "approved": True,
+            "smart_approved": True,
+            "smart_approval_decision": "approve",
+            "description": "shell command via -c/-lc flag",
+            "approval_reason": "The command only prints a fixed string.",
+        },
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            "printf ok",
+            timeout=5,
+            task_id="test-smart-approve-terminal-note",
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert "auto-approved by smart approval" in result["approval"]
+    assert "prints a fixed string" in result["approval"]
+
+
+def test_smart_approval_guard_emits_progress_event(monkeypatch):
+    events = []
+
+    def capture(event_type, tool_name=None, preview=None, args=None, **kwargs):
+        events.append({
+            "event_type": event_type,
+            "tool_name": tool_name,
+            "preview": preview,
+            "args": args,
+            "kwargs": kwargs,
+        })
+
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards_impl",
+        lambda _command, _env_type, approval_callback=None, cwd=None, has_host_access=False: {
+            "approved": True,
+            "smart_approved": True,
+            "smart_approval_decision": "approve",
+            "description": "shell command via -c/-lc flag",
+            "approval_reason": "The command only prints a fixed string.",
+        },
+    )
+
+    terminal_tool.set_approval_progress_callback(capture)
+    result = terminal_tool._check_all_guards("printf ok", "local")
+
+    assert result["approved"] is True
+    assert events == [
+        {
+            "event_type": "approval.judged",
+            "tool_name": "terminal",
+            "preview": None,
+            "args": {
+                "decision": "approve",
+                "description": "shell command via -c/-lc flag",
+                "reason": "The command only prints a fixed string.",
+                "source": "smart_approval",
+            },
+            "kwargs": {},
+        }
+    ]
+
+
+def test_deterministic_auto_approval_does_not_emit_progress_event(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards_impl",
+        lambda _command, _env_type, approval_callback=None, cwd=None, has_host_access=False: {
+            "approved": True,
+            "auto_approved": True,
+            "description": "read-only shell wrapper",
+        },
+    )
+
+    terminal_tool.set_approval_progress_callback(lambda *args, **kwargs: events.append((args, kwargs)))
+    result = terminal_tool._check_all_guards("printf ok", "local")
+
+    assert result["approved"] is True
+    assert events == []
+
+
+def test_terminal_passes_effective_workdir_to_approval_context(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_guard(command, env_type, approval_callback=None, cwd=None, has_host_access=False):
+        captured["cwd"] = cwd
+        return {"approved": True, "message": None}
+
+    monkeypatch.setattr(terminal_tool, "_check_all_guards_impl", fake_guard)
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            "printf ok",
+            timeout=5,
+            workdir=str(tmp_path),
+            task_id="test-approval-context-workdir",
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert captured["cwd"] == str(tmp_path)
 
 
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):

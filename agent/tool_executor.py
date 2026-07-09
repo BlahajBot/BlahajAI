@@ -40,6 +40,7 @@ from agent.tool_dispatch_helpers import (
 )
 from tools.terminal_tool import (
     get_active_env,
+    set_approval_progress_callback as _set_approval_progress_callback,
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
@@ -589,6 +590,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Approval/sudo callbacks (thread-local) and the agent turn's
         # ContextVars are propagated by propagate_context_to_thread() at the
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
+        if agent.tool_progress_callback is not None:
+            try:
+                _set_approval_progress_callback(agent.tool_progress_callback)
+            except Exception:
+                pass
         start = time.time()
         try:
             try:
@@ -641,6 +647,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 agent._tool_worker_threads.discard(_worker_tid)
             try:
                 _ra()._set_interrupt(False, _worker_tid)
+            except Exception:
+                pass
+            try:
+                _set_approval_progress_callback(None)
             except Exception:
                 pass
 
@@ -1431,6 +1441,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _spinner_result = None
             approval_context_token = _bind_approval_user_messages_context(messages)
+            _set_approval_progress_callback(getattr(agent, "tool_progress_callback", None))
             try:
                 try:
                     function_result = _ra().handle_function_call(
@@ -1447,6 +1458,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                     )
                 finally:
+                    _set_approval_progress_callback(None)
                     _reset_approval_user_messages_context(approval_context_token)
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1477,6 +1489,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             approval_context_token = _bind_approval_user_messages_context(messages)
+            _set_approval_progress_callback(getattr(agent, "tool_progress_callback", None))
             try:
                 try:
                     function_result = _ra().handle_function_call(
@@ -1493,6 +1506,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                     )
                 finally:
+                    _set_approval_progress_callback(None)
                     _reset_approval_user_messages_context(approval_context_token)
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(

@@ -181,6 +181,18 @@ def _get_approval_callback():
     return getattr(_callback_tls, "approval", None)
 
 
+def _get_approval_progress_callback():
+    return getattr(_callback_tls, "approval_progress", None)
+
+
+def _get_approval_context_cwd():
+    return getattr(_callback_tls, "approval_context_cwd", None)
+
+
+def _set_approval_context_cwd(cwd):
+    _callback_tls.approval_context_cwd = cwd
+
+
 def set_sudo_password_callback(cb):
     """Register a callback for sudo password prompts (used by CLI).
 
@@ -198,6 +210,35 @@ def set_approval_callback(cb):
     GHSA-qg5c-hvr5-hjgr.
     """
     _callback_tls.approval = cb
+
+
+def set_approval_progress_callback(cb):
+    """Register a per-thread callback for approval audit/progress events."""
+    _callback_tls.approval_progress = cb
+
+
+def _emit_smart_approval_progress(approval: dict) -> None:
+    """Publish a visible audit event for LLM-backed smart approvals only."""
+    decision = approval.get("smart_approval_decision")
+    if decision not in {"approve", "deny", "escalate"}:
+        return
+    callback = _get_approval_progress_callback()
+    if callback is None:
+        return
+    try:
+        callback(
+            "approval.judged",
+            "terminal",
+            None,
+            {
+                "decision": decision,
+                "description": approval.get("description", ""),
+                "reason": approval.get("approval_reason", ""),
+                "source": "smart_approval",
+            },
+        )
+    except Exception as exc:
+        logger.debug("approval progress callback failed: %s", exc)
 
 
 def _get_sudo_password_cache_scope() -> str:
@@ -281,9 +322,38 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 def _check_all_guards(command: str, env_type: str,
                       has_host_access: bool = False) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
-    return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+    approval = _check_all_guards_impl(command, env_type,
+                                      approval_callback=_get_approval_callback(),
+                                      has_host_access=has_host_access,
+                                      cwd=_get_approval_context_cwd())
+    _emit_smart_approval_progress(approval)
+    return approval
+
+
+def _format_approval_note(approval: dict) -> str | None:
+    """Build the user/model-visible approval note for terminal results."""
+    desc = approval.get("description", "flagged as dangerous")
+    reason = approval.get("approval_reason")
+    if approval.get("user_approved"):
+        note = f"Command required approval ({desc}) and was approved by the user."
+        if approval.get("smart_escalated"):
+            note += " smart approval escalated instead of auto-approving."
+        if reason:
+            note += f" Rationale: {reason}"
+        return note
+    if approval.get("smart_approved"):
+        note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+        if reason:
+            note += f" Rationale: {reason}"
+        return note
+    if approval.get("smart_denied"):
+        note = f"Command was flagged ({desc}) and denied by smart approval."
+        if reason:
+            note += f" Rationale: {reason}"
+        return note
+    if approval.get("auto_approved"):
+        return f"Command was flagged and auto-approved by deterministic approval ({desc})."
+    return None
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2270,6 +2340,26 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # Validate and bind the effective cwd before approval so smart approval
+        # can inspect local path context for the directory the command will use.
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+        approval_context_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            env=env,
+            default_cwd=cwd,
+        )
+        _set_approval_context_cwd(approval_context_cwd)
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
@@ -2302,20 +2392,19 @@ def terminal_tool(
                     f"Command denied: {desc}. "
                     "Use the approval prompt to allow it, or rephrase the command."
                 )
-                return json.dumps({
+                blocked_result = {
                     "output": "",
                     "exit_code": -1,
                     "error": approval.get("message", fallback_msg),
-                    "status": "blocked"
-                }, ensure_ascii=False)
-            # Track whether approval was explicitly granted by the user
+                    "status": "blocked",
+                }
+                blocked_note = _format_approval_note(approval)
+                if blocked_note:
+                    blocked_result["approval"] = blocked_note
+                return json.dumps(blocked_result, ensure_ascii=False)
+            approval_note = _format_approval_note(approval)
             if approval.get("user_approved"):
-                desc = approval.get("description", "flagged as dangerous")
-                approval_note = f"Command required approval ({desc}) and was approved by the user."
                 _approved_run = True
-            elif approval.get("smart_approved"):
-                desc = approval.get("description", "flagged as dangerous")
-                approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
         # Validate workdir against shell injection
         if workdir:
